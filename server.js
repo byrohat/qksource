@@ -102,7 +102,7 @@ const CAPTCHA_SUBMIT = envStr("SEL_CAPTCHA_SUBMIT", "button:has-text('Submit'), 
 const CAPTCHA_IMAGE = envStr("SEL_CAPTCHA_IMAGE", "");
 const CAPTCHA_WIDGETS = envStr("SEL_CAPTCHA", "")
   ? [envStr("SEL_CAPTCHA", "")]
-  : ["iframe[src*='recaptcha']", "iframe[src*='hcaptcha']", "iframe[src*='turnstile']", ".g-recaptcha", "#captcha"];
+  : ["iframe[src*='recaptcha']", "iframe[src*='hcaptcha']", ".g-recaptcha", "#captcha"];
 
 const SEL = {
   loginUrl: envStr("QK_LOGIN_URL", envStr("SEL_LOGIN_URL", "https://qksource.com/register.html")),
@@ -285,7 +285,8 @@ function messageFor(step, err) {
   if (err?.blockerKind === "credentials") return `Adım ${n}: CJ kimlik bilgileri reddedildi`;
   if (err?.code === "bad-url") return `Adım ${n}: Kayıt adresi geçersiz (QK_LOGIN_URL)`;
   if (err?.code === "no-redirect") {
-    const extra = [err.surfaces, formatCjDiag(err.diag), err.trace].filter(Boolean).join(" | ");
+    const hedef = err.popupIntent && !String(err.surfaces || "").includes("popup hedef:") ? `popup hedef: ${err.popupIntent}` : "";
+    const extra = [err.surfaces, hedef, formatCjDiag(err.diag), err.trace].filter(Boolean).join(" | ");
     return `Adım ${n}: CJ penceresi veya yönlendirme algılanamadı. ${extra}`.trim();
   }
   if (err?.code === "not-left") return `Adım ${n}: CJ ikonu WhatsApp'ın solunda değil${err.position ? ` (${err.position})` : ""}`;
@@ -369,7 +370,69 @@ async function anyVisible(root, selectors) {
   return false;
 }
 
+function validationMarkersInDocument() {
+  const meta = document.querySelector("meta[name='validation']");
+  const verify = document.querySelector("#verifyCode");
+  const title = document.title || "";
+  return !!(verify || meta || /human verification/i.test(title));
+}
+
+function registerFormInDocument() {
+  const text = (document.body?.innerText || "").slice(0, 12000);
+  if (/Welcome to Qksource/i.test(text)) return true;
+  if (/Create a Qksource account/i.test(text)) return true;
+  if (/Confirm Password/i.test(text)) return true;
+  const visible = (el) => {
+    if (!el?.getClientRects?.().length) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
+  };
+  const textOf = (el) => {
+    const cls = typeof el.className === "string" ? el.className : (el.getAttribute?.("class") || "");
+    return [el.getAttribute?.("src"), el.getAttribute?.("href"), el.getAttribute?.("alt"), el.getAttribute?.("aria-label"), el.getAttribute?.("title"), cls].filter(Boolean).join(" ");
+  };
+  return [...document.querySelectorAll("img, svg, i, span, a, button")].some((el) => visible(el) && /whatsapp/i.test(textOf(el)));
+}
+
+function turnstileWidgetInDocument() {
+  return !!document.querySelector(".cf-turnstile, iframe[src*='challenges.cloudflare.com'], iframe[src*='turnstile'], script[src*='turnstile'], script[src*='challenges.cloudflare.com']");
+}
+
+function turnstileTokenInDocument() {
+  const fields = document.querySelectorAll("input[name='cf-turnstile-response'], textarea[name='cf-turnstile-response']");
+  for (const field of fields) {
+    if (String(field.value || "").trim()) return true;
+  }
+  return false;
+}
+
+async function anyFrame(page, fn) {
+  if (!pageOpen(page)) return false;
+  for (const frame of safeFrames(page)) {
+    const hit = await frame.evaluate(fn).catch(() => false);
+    if (hit) return true;
+  }
+  return false;
+}
+
+function turnstileTimeout() {
+  return envMs("TIMEOUT_TURNSTILE", 30000);
+}
+
+// Turnstile kendi jetonunu yazar. Biz yalnızca bekleriz; jeton üretilmez.
+async function waitForTurnstile(page, deadline) {
+  const end = deadline || (Date.now() + turnstileTimeout());
+  if (Date.now() >= end) return;
+  if (!(await anyFrame(page, turnstileWidgetInDocument))) return;
+  while (Date.now() < end) {
+    if (await anyFrame(page, turnstileTokenInDocument)) return;
+    if (!(await anyFrame(page, turnstileWidgetInDocument))) return;
+    await delay(400);
+  }
+}
+
 async function frameHasCaptcha(frame) {
+  if (await frame.evaluate(validationMarkersInDocument).catch(() => false)) return true;
   if (await anyVisible(frame, CAPTCHA_WIDGETS)) return true;
   const prompt = await frame.locator("text=/we would like to make sure you are not a robot|please enter verification code|doğrulama kodu|not a robot/i").first().isVisible().catch(() => false);
   if (!prompt) return false;
@@ -719,6 +782,28 @@ function parseProxyUrl(raw) {
   return proxy;
 }
 
+function shouldAbortRequest(request) {
+  const type = request.resourceType();
+  if (type === "document") return false;
+  const url = request.url();
+  if (/challenges\.cloudflare\.com|turnstile/i.test(url)) return false;
+  let host = "";
+  try { host = new URL(url).hostname.toLowerCase(); } catch { return false; }
+  const localImage = host === "qksource.com" || host.endsWith(".qksource.com") || host === "localhost" || host === "127.0.0.1" || host === "::1";
+  if (type === "image" || type === "media") {
+    if (localImage || /captcha|verify/i.test(url)) return false;
+    return true;
+  }
+  if (type === "font") return true;
+  if (host === "fonts.googleapis.com" || host === "fonts.gstatic.com") return true;
+  if (host === "accounts.google.com" && /\/gsi\//i.test(url)) return true;
+  if (host === "connect.facebook.net" || host.endsWith(".facebook.net")) return true;
+  if (/(^|\.)google-analytics\.com$|(^|\.)googletagmanager\.com$|(^|\.)doubleclick\.net$|(^|\.)hotjar\.com$|(^|\.)segment\.com$|(^|\.)segment\.io$|(^|\.)mixpanel\.com$/.test(host)) return true;
+  if (host === "yesourcing.com" || host.endsWith(".yesourcing.com")) return true;
+  if ((host === "cjdropshipping.com" || host.endsWith(".cjdropshipping.com")) && /\/backend\/Country\.json/i.test(url)) return true;
+  return false;
+}
+
 async function launchChromium() {
   const proxy = parseProxyUrl(PROXY_URL);
   const browser = await chromium.launch({
@@ -735,8 +820,21 @@ async function launchChromium() {
     extraHTTPHeaders: { "Accept-Language": language },
   });
   // Chromium, locale yüzünden Accept-Language'i tek etikete indirir. İsteklerde tam listeyi geri yazarız.
+  // Proxy'yi yormamak için captcha ve Turnstile dışındaki üçüncü taraf istekleri kesilir.
+  const blockedHosts = new Set();
   await context.route("**/*", async (route) => {
-    const headers = { ...route.request().headers(), "accept-language": language };
+    const request = route.request();
+    if (shouldAbortRequest(request)) {
+      let host = request.url();
+      try { host = new URL(request.url()).hostname; } catch { /* adres olduğu gibi */ }
+      if (blockedHosts.size < 12 && !blockedHosts.has(host)) {
+        blockedHosts.add(host);
+        log({ level: "info", step: "browser", event: "block", message: `Üçüncü taraf istek kesildi: ${host}` });
+      }
+      await route.abort("blockedbyclient").catch(() => {});
+      return;
+    }
+    const headers = { ...request.headers(), "accept-language": language };
     await route.continue({ headers });
   });
   return { browser, context };
@@ -762,34 +860,43 @@ function findCjInDocument() {
     const s = getComputedStyle(el);
     return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
   };
+  const validation = document.querySelector("#verifyCode")
+    || document.querySelector("meta[name='validation']")
+    || /human verification/i.test(document.title || "");
+  if (validation) return null;
+  const banned = (el) => !el
+    || el.id === "verifyCode"
+    || !!el.closest?.("#verifyCode, #validation, .validation-page, [data-page='validation']");
   const nodes = [...document.querySelectorAll("img, svg, i, span, a, button, [role='button']")];
-  const wa = nodes.find((el) => visible(el) && /whatsapp/i.test(textOf(el)));
+  const wa = nodes.find((el) => visible(el) && /whatsapp/i.test(textOf(el)) && !banned(el));
   const clickable = (el) => {
     const host = el.closest?.("a, button, [role='button']");
-    if (!host) return el;
+    if (!host || banned(host)) return el;
     if (wa && host.contains(wa) && host !== el) return el;
     return host;
   };
-  if (wa) {
-    let row = wa.parentElement;
-    for (let i = 0; i < 6 && row; i += 1) {
-      const icons = [...row.querySelectorAll("img, svg")].filter(visible);
-      if (icons.length >= 4) break;
-      row = row.parentElement;
-    }
-    const wr = wa.getBoundingClientRect();
-    const left = [...(row?.querySelectorAll("a, button, img, svg, span, i") || [])]
-      .filter((el) => visible(el) && el !== wa && !el.contains(wa))
-      .map((el) => ({ el, r: el.getBoundingClientRect() }))
-      .filter(({ r }) => r.width > 8 && r.height > 8 && r.right <= wr.left + 8)
-      .filter(({ r }) => Math.abs((r.top + r.bottom) / 2 - (wr.top + wr.bottom) / 2) < Math.max(48, wr.height * 1.5))
-      .sort((a, b) => a.r.left - b.r.left);
-    const marked = left.find(({ el }) => /cj/i.test(textOf(el)));
-    const chosen = (marked || left[0])?.el;
-    if (chosen) return clickable(chosen);
+  if (!wa) return null;
+  let row = wa.parentElement;
+  let best = row;
+  for (let i = 0; i < 6 && row; i += 1) {
+    best = row;
+    const icons = [...row.querySelectorAll("img, svg")].filter((el) => visible(el) && !banned(el));
+    if (icons.length >= 4 || !row.parentElement) break;
+    row = row.parentElement;
   }
-  const cj = nodes.find((el) => visible(el) && /cj/i.test(textOf(el)) && !/whatsapp/i.test(textOf(el)));
-  return cj ? clickable(cj) : null;
+  row = best;
+  const wr = wa.getBoundingClientRect();
+  const left = [...(row?.querySelectorAll("a, button, img, svg, span, i") || [])]
+    .filter((el) => visible(el) && el !== wa && !el.contains(wa) && !banned(el))
+    .map((el) => ({ el, r: el.getBoundingClientRect() }))
+    .filter(({ r }) => r.width > 8 && r.height > 8 && r.right <= wr.left + 8)
+    .filter(({ r }) => Math.abs((r.top + r.bottom) / 2 - (wr.top + wr.bottom) / 2) < Math.max(48, wr.height * 1.5))
+    .sort((a, b) => a.r.left - b.r.left);
+  const marked = left.find(({ el }) => /cj/i.test(textOf(el)));
+  const chosen = (marked || left[0])?.el;
+  if (!chosen || banned(chosen)) return null;
+  const host = clickable(chosen);
+  return banned(host) ? null : host;
 }
 
 async function findCj(page) {
@@ -818,6 +925,9 @@ async function positionAgainstWhatsapp(el) {
       const s = getComputedStyle(item);
       return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
     };
+    if (node.id === "verifyCode" || node.closest?.("#verifyCode") || document.querySelector("#verifyCode") || document.querySelector("meta[name='validation']") || /human verification/i.test(document.title || "")) {
+      return { ok: false, reason: "verifyCode" };
+    }
     const wa = [...document.querySelectorAll("img, svg, i, span, a, button")].find((item) => visible(item) && /whatsapp/i.test(textOf(item)));
     if (!wa) return { ok: true, reason: "whatsapp-yok" };
     const wr = wa.getBoundingClientRect();
@@ -832,12 +942,47 @@ function isCjUrl(url) {
   return /cjdropshipping|cj\.com/i.test(String(url || ""));
 }
 
+function isChromeError(url) {
+  return /^chrome-error:/i.test(String(url || "")) || /chromewebdata/i.test(String(url || ""));
+}
+
+const popupIntents = new WeakMap();
+
+function intentOf(popup) {
+  return popup ? (popupIntents.get(popup) || "") : "";
+}
+
+function notePopupRequest(session, popup, req) {
+  if (!popup || popup === session.page) return;
+  let frame = null;
+  try { frame = req.frame(); } catch { return; }
+  try {
+    if (frame !== popup.mainFrame()) return;
+  } catch { return; }
+  let navigation = false;
+  try { navigation = req.isNavigationRequest() || req.resourceType() === "document"; } catch { navigation = false; }
+  if (!navigation) return;
+  const url = req.url();
+  if (!/^https?:/i.test(url) || isChromeError(url)) return;
+  if (!popupIntents.has(popup)) popupIntents.set(popup, url);
+  if (!session.popupIntent) session.popupIntent = url;
+}
+
+function cjNavTimeout() {
+  const set = typeof process.env.TIMEOUT_CJ_NAVIGATION === "string" && process.env.TIMEOUT_CJ_NAVIGATION.trim();
+  if (set) return envMs("TIMEOUT_CJ_NAVIGATION", 45000);
+  const proxy = typeof process.env.PROXY_URL === "string" && process.env.PROXY_URL.trim();
+  return proxy ? 90000 : 45000;
+}
+
 async function describeSurfaces(session) {
   const lines = [];
   const pages = session?.context?.pages?.() || [];
   for (const p of pages) {
     const url = pageOpen(p) ? (currentUrl(p) || "(boş)") : "(kapalı)";
-    lines.push(`${p === session.page ? "ana" : "pencere"}: ${url}`);
+    const intent = intentOf(p) || (p !== session.page ? session.popupIntent : "") || "";
+    const hedef = intent && (isChromeError(url) || intent !== url) ? ` | popup hedef: ${intent}` : "";
+    lines.push(`${p === session.page ? "ana" : "pencere"}: ${url}${hedef}`);
     for (const frame of safeFrames(p)) {
       let frameUrl = "";
       try { frameUrl = frame.url(); } catch { continue; }
@@ -904,8 +1049,58 @@ function armSurfaceWatch(session) {
   const page = session.page;
   const startUrl = page.url();
   const popups = [];
-  const onPage = (popup) => { popups.push(popup); };
+  const retryJobs = new WeakMap();
+  const track = (popup) => {
+    if (!popup || popups.includes(popup)) return;
+    popups.push(popup);
+    const onReq = (req) => notePopupRequest(session, popup, req);
+    popup.on("request", onReq);
+    popup.on("requestfailed", onReq);
+  };
+  const onPage = (popup) => { track(popup); };
+  const onContextRequest = (req) => {
+    let popup = null;
+    try { popup = req.frame()?.page(); } catch { return; }
+    if (!popup || popup === page) return;
+    track(popup);
+    notePopupRequest(session, popup, req);
+  };
   session.context.on("page", onPage);
+  session.context.on("request", onContextRequest);
+  session.context.on("requestfailed", onContextRequest);
+  const retryChromeError = (popup) => {
+    const existing = retryJobs.get(popup);
+    if (existing) return existing;
+    const job = (async () => {
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        if (!pageOpen(popup)) return;
+        const current = currentUrl(popup) || "";
+        if (current && current !== "about:blank" && !isChromeError(current)) return;
+        const target = intentOf(popup) || session.popupIntent || "";
+        log({
+          level: "info",
+          step: STEPS.popup.id,
+          stepNo: STEPS.popup.n,
+          stepName: STEPS.popup.name,
+          event: "popup-retry",
+          email: session.email,
+          sessionId: session.id,
+          url: target || current,
+          message: `CJ popup yeniden deneniyor ${attempt}/3${target ? `: ${target}` : ""}`,
+        });
+        try {
+          if (target) await popup.goto(target, { waitUntil: "domcontentloaded", timeout: cjNavTimeout() });
+          else await popup.reload({ waitUntil: "domcontentloaded", timeout: cjNavTimeout() });
+        } catch {
+          // Zaman aşımı ve net::ERR_ yeniden denemeyi kesmez.
+        }
+        const after = currentUrl(popup) || "";
+        if (after && after !== "about:blank" && !isChromeError(after)) return;
+      }
+    })();
+    retryJobs.set(popup, job);
+    return job;
+  };
   const look = async () => {
     const candidates = [...popups];
     for (const candidate of session.context.pages()) {
@@ -915,20 +1110,24 @@ function armSurfaceWatch(session) {
       if (!pageOpen(candidate)) continue;
       if (candidate !== page) {
         const candidateUrl = currentUrl(candidate) || "";
-        if (candidateUrl && candidateUrl !== "about:blank") return { kind: "popup", page: candidate };
+        if (isChromeError(candidateUrl)) {
+          void retryChromeError(candidate);
+          continue;
+        }
+        if (candidateUrl && candidateUrl !== "about:blank") return { kind: "popup", page: candidate, intent: intentOf(candidate) || session.popupIntent || "" };
       }
       for (const frame of safeFrames(candidate)) {
         if (frame === candidate.mainFrame()) continue;
         let frameUrl = "";
         try { frameUrl = frame.url(); } catch { continue; }
-        if (!frameUrl || frameUrl === "about:blank") continue;
+        if (!frameUrl || frameUrl === "about:blank" || isChromeError(frameUrl)) continue;
         if (isCjUrl(frameUrl)) return { kind: "frame", frame, page: candidate };
         const emailVisible = await frame.locator(SEL.cjEmail).first().isVisible().catch(() => false);
         if (emailVisible) return { kind: "frame", frame, page: candidate };
       }
     }
     const mainUrl = currentUrl(page) || "";
-    if (mainUrl && (isCjUrl(mainUrl) || (pathOf(mainUrl) && pathOf(mainUrl) !== pathOf(startUrl)))) {
+    if (mainUrl && !isChromeError(mainUrl) && (isCjUrl(mainUrl) || (pathOf(mainUrl) && pathOf(mainUrl) !== pathOf(startUrl)))) {
       return { kind: "redirect", page };
     }
     return null;
@@ -946,8 +1145,23 @@ function armSurfaceWatch(session) {
       }
       return look().catch(() => null);
     },
+    async once() {
+      return look().catch(() => null);
+    },
+    async finishRetries() {
+      const jobs = [];
+      for (const candidate of session.context.pages()) {
+        if (candidate === page || !pageOpen(candidate)) continue;
+        const url = currentUrl(candidate) || "";
+        if (!isChromeError(url) && !retryJobs.has(candidate)) continue;
+        jobs.push(retryChromeError(candidate));
+      }
+      await Promise.all(jobs.map((job) => Promise.resolve(job).catch(() => {})));
+    },
     stop() {
       session.context?.off("page", onPage);
+      session.context?.off("request", onContextRequest);
+      session.context?.off("requestfailed", onContextRequest);
     },
   };
 }
@@ -967,7 +1181,9 @@ function attachClickTrace(session) {
   const onFailed = (req) => {
     const url = req.url();
     if (/favicon\.ico/i.test(url)) return;
-    push(`istek fail ${req.failure()?.errorText || "fail"} ${req.method()} ${url}`);
+    const reason = req.failure()?.errorText || "";
+    if (/ERR_BLOCKED_BY_CLIENT|blockedbyclient/i.test(reason)) return;
+    push(`istek fail ${reason || "fail"} ${req.method()} ${url}`);
   };
   const onResponse = (res) => {
     if (res.status() < 400) return;
@@ -1115,13 +1331,28 @@ async function checkAgreement(page) {
   return names;
 }
 
+async function cjTargetsCaptcha(el) {
+  if (!el) return false;
+  return el.evaluate((node) => {
+    const title = document.title || "";
+    if (document.querySelector("meta[name='validation']") || /human verification/i.test(title) || document.querySelector("#verifyCode")) return true;
+    if (node.id === "verifyCode" || node.closest?.("#verifyCode")) return true;
+    if (node.closest?.("#validation, .validation-page, [data-page='validation']")) return true;
+    return false;
+  }).catch(() => false);
+}
+
 async function acquireCj(session) {
   const page = session.page;
   if (!pageOpen(page)) return null;
-  if (CJ_BUTTON_OVERRIDE) {
-    return page.locator(CJ_BUTTON_OVERRIDE).first().elementHandle({ timeout: 3000 }).catch(() => null);
+  const el = CJ_BUTTON_OVERRIDE
+    ? await page.locator(CJ_BUTTON_OVERRIDE).first().elementHandle({ timeout: 3000 }).catch(() => null)
+    : await findCj(page);
+  if (el && await cjTargetsCaptcha(el)) {
+    await el.dispose().catch(() => {});
+    return null;
   }
-  return findCj(page);
+  return el;
 }
 
 async function rememberCj(session, el) {
@@ -1360,7 +1591,8 @@ async function runStep(ctx, step, fn) {
     const kind = blockerKindOf(step, err);
     const diagText = formatCjDiag(ctx.cjDiag);
     const trace = Array.isArray(ctx.clickTrace) ? ctx.clickTrace.join(" | ") : "";
-    const detailText = [publicDetail(err), surfaces, diagText, trace].filter(Boolean).join(" | ");
+    const intentLine = ctx.popupIntent && !String(surfaces || "").includes("popup hedef:") ? `popup hedef: ${ctx.popupIntent}` : "";
+    const detailText = [publicDetail(err), surfaces, intentLine, diagText, trace].filter(Boolean).join(" | ");
     log({
       level: "error",
       step: step.id,
@@ -1480,7 +1712,13 @@ async function drive(session) {
 const STEP_FNS = {
   async cjButton(session) {
     const page = session.page;
+    const pauseCaptcha = () => {
+      const pause = new Error("captcha");
+      pause.captchaPause = true;
+      throw pause;
+    };
     let el = null;
+    if (await anyFrame(page, validationMarkersInDocument)) pauseCaptcha();
     if (CJ_BUTTON_OVERRIDE) {
       const btn = page.locator(CJ_BUTTON_OVERRIDE).first();
       try {
@@ -1493,16 +1731,25 @@ const STEP_FNS = {
     } else {
       const deadline = Date.now() + TIMEOUTS.cjButton;
       while (Date.now() < deadline) {
+        if (await anyFrame(page, validationMarkersInDocument)) pauseCaptcha();
         el = await findCj(page);
         if (el) break;
         await delay(200);
       }
-      if (!el) throw Object.assign(new Error("missing-button"), { code: "missing-button" });
+      if (!el) {
+        if (await anyFrame(page, validationMarkersInDocument)) pauseCaptcha();
+        throw Object.assign(new Error("missing-button"), { code: "missing-button" });
+      }
       const position = await positionAgainstWhatsapp(el).catch(() => ({ ok: true, reason: "whatsapp-yok" }));
       if (position && position.ok === false) {
         await el.dispose().catch(() => {});
+        if (position.reason === "verifyCode" || await anyFrame(page, validationMarkersInDocument)) pauseCaptcha();
         throw Object.assign(new Error("not-left"), { code: "not-left", position: `ikon x=${position.left}, WhatsApp x=${position.wa}` });
       }
+    }
+    if (el && await cjTargetsCaptcha(el)) {
+      await el.dispose().catch(() => {});
+      pauseCaptcha();
     }
     try {
       await rememberCj(session, el);
@@ -1535,6 +1782,11 @@ const STEP_FNS = {
         });
       }
       opened = await runCjStrategies(session, watch);
+      if (!opened?.target) {
+        await watch.finishRetries();
+        const late = await watch.once();
+        if (late) opened = { target: late, winner: "yeniden" };
+      }
     } finally {
       watch.stop();
       stopTrace();
@@ -1544,6 +1796,7 @@ const STEP_FNS = {
       throw Object.assign(new Error("no-redirect"), {
         code: "no-redirect",
         surfaces: await describeSurfaces(session),
+        popupIntent: session.popupIntent || "",
         diag: session.cjDiag,
         trace: (session.clickTrace || []).join(" | "),
       });
@@ -1552,7 +1805,7 @@ const STEP_FNS = {
     if (target.kind === "popup") {
       session.popup = target.page;
       session.active = target.page;
-      await target.page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }).catch((err) => {
+      await target.page.waitForLoadState("domcontentloaded", { timeout: cjNavTimeout() }).catch((err) => {
         if (!isContextDestroyed(err) && !isTimeout(err)) throw err;
       });
     } else if (target.kind === "frame") {
@@ -1723,20 +1976,18 @@ function pathOf(url) {
 }
 
 async function leftCaptcha(page, url, startUrl) {
-  if (isRegisterPath(url)) return true;
+  if (await anyFrame(page, validationMarkersInDocument)) return false;
+  if (await anyFrame(page, registerFormInDocument)) return true;
   if (!url || pathOf(url) === pathOf(startUrl) || isValidationPath(url)) return false;
   return !(await isCaptchaPage(page).catch(() => true));
 }
 
-async function settleAfterCaptchaSubmit(page, beforeSrc, startUrl, hadError) {
+async function settleAfterCaptchaSubmit(page, beforeSrc, startUrl, hadError, turnstileDeadline) {
+  await waitForTurnstile(page, turnstileDeadline).catch(() => {});
   const timeout = TIMEOUTS.captcha;
   let stop = false;
   let sawReload = false;
-  const registerWait = page.waitForURL(
-    (url) => /\/register\.html\/?$/i.test(url.pathname),
-    { timeout, waitUntil: "domcontentloaded" },
-  ).then(() => "register").catch((err) => (isContextDestroyed(err) ? "destroyed" : "register-timeout"));
-  const changeWait = (async () => {
+  const changeWait = async () => {
     const deadline = Date.now() + timeout;
     while (!stop && Date.now() < deadline) {
       let url = "";
@@ -1765,10 +2016,10 @@ async function settleAfterCaptchaSubmit(page, beforeSrc, startUrl, hadError) {
       await delay(300);
     }
     return "timeout";
-  })();
+  };
   let winner;
   try {
-    winner = await Promise.race([registerWait, changeWait]);
+    winner = await changeWait();
   } finally {
     stop = true;
   }
@@ -1776,12 +2027,16 @@ async function settleAfterCaptchaSubmit(page, beforeSrc, startUrl, hadError) {
     await page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }).catch((err) => {
       if (!isContextDestroyed(err) && !isTimeout(err)) throw err;
     });
-    return "register";
+    const url = currentUrl(page) || "";
+    if (await anyFrame(page, validationMarkersInDocument)) return "captcha";
+    if (await leftCaptcha(page, url, startUrl)) return "register";
+    return "captcha";
   }
   if (winner === "captcha") return "captcha";
   await page.waitForLoadState("domcontentloaded", { timeout: Math.min(TIMEOUTS.navigation, 15000) }).catch(() => {});
   const url = currentUrl(page) || "";
   if (await leftCaptcha(page, url, startUrl)) return "register";
+  if (await anyFrame(page, validationMarkersInDocument).catch(() => false)) return "captcha";
   if (isValidationPath(url) || pathOf(url) === pathOf(startUrl) || await isCaptchaPage(page).catch(() => false)) return "captcha";
   throw Object.assign(new Error(`Timeout exceeded while waiting after captcha submit (${url || "url yok"})`), { name: "TimeoutError" });
 }
@@ -1792,6 +2047,7 @@ async function submitCaptchaCode(session, code) {
   session.currentStep = STEPS.captcha;
   if (!(await isCaptchaPage(page).catch(() => false))) return drive(session);
   let outcome = "register";
+  const turnstileDeadline = Date.now() + turnstileTimeout();
   await runStep(session, STEPS.captcha, async () => {
     const before = await queryCaptchaState(page).catch(() => ({ src: "" }));
     const hadError = await captchaErrorVisible(page).catch(() => false);
@@ -1799,12 +2055,13 @@ async function submitCaptchaCode(session, code) {
     const input = page.locator(CAPTCHA_INPUT).first();
     await input.waitFor({ state: "visible", timeout: TIMEOUTS.captcha });
     await input.fill(String(code), { timeout: TIMEOUTS.captcha });
+    await waitForTurnstile(page, turnstileDeadline);
     try {
       await page.locator(CAPTCHA_SUBMIT).first().click({ timeout: TIMEOUTS.captcha, noWaitAfter: true });
     } catch (err) {
       if (!isContextDestroyed(err)) throw err;
     }
-    outcome = await settleAfterCaptchaSubmit(page, before?.src || "", startUrl, hadError);
+    outcome = await settleAfterCaptchaSubmit(page, before?.src || "", startUrl, hadError, turnstileDeadline);
   });
   if (outcome === "captcha") return captchaResult(session, await captureCaptchaImage(page));
   return drive(session);
@@ -1871,10 +2128,10 @@ async function withSessionSecrets(session, code, fn) {
   }
 }
 
-const configured = ["QK_LOGIN_URL", "SEL_LOGIN_URL", "SEL_CJ_BUTTON", "SEL_CJ_EMAIL", "SEL_CJ_PASSWORD", "SEL_CJ_SUBMIT", "SEL_CJ_AUTHORIZE", "SEL_SUCCESS", "SEL_ERROR_TEXT", "SEL_CAPTCHA", "SEL_CAPTCHA_INPUT", "SEL_CAPTCHA_SUBMIT", "SEL_CAPTCHA_IMAGE", "BROWSER_LOCALE", "BROWSER_TZ", "BROWSER_UA", "PROXY_URL", "TIMEOUT_OPEN_LOGIN", "TIMEOUT_CAPTCHA", "TIMEOUT_CJ_BUTTON", "TIMEOUT_CJ_CLICK", "TIMEOUT_POPUP", "TIMEOUT_NAVIGATION", "TIMEOUT_EMAIL", "TIMEOUT_PASSWORD", "TIMEOUT_SUBMIT", "TIMEOUT_AUTHORIZE", "TIMEOUT_SUCCESS", "SESSION_TTL_MS"]
+const configured = ["QK_LOGIN_URL", "SEL_LOGIN_URL", "SEL_CJ_BUTTON", "SEL_CJ_EMAIL", "SEL_CJ_PASSWORD", "SEL_CJ_SUBMIT", "SEL_CJ_AUTHORIZE", "SEL_SUCCESS", "SEL_ERROR_TEXT", "SEL_CAPTCHA", "SEL_CAPTCHA_INPUT", "SEL_CAPTCHA_SUBMIT", "SEL_CAPTCHA_IMAGE", "BROWSER_LOCALE", "BROWSER_TZ", "BROWSER_UA", "PROXY_URL", "TIMEOUT_OPEN_LOGIN", "TIMEOUT_CAPTCHA", "TIMEOUT_CJ_BUTTON", "TIMEOUT_CJ_CLICK", "TIMEOUT_CJ_NAVIGATION", "TIMEOUT_TURNSTILE", "TIMEOUT_POPUP", "TIMEOUT_NAVIGATION", "TIMEOUT_EMAIL", "TIMEOUT_PASSWORD", "TIMEOUT_SUBMIT", "TIMEOUT_AUTHORIZE", "TIMEOUT_SUCCESS", "SESSION_TTL_MS"]
   .filter((name) => typeof process.env[name] === "string" && process.env[name].trim() !== "");
 log({ level: "info", step: "config", event: "env", message: configured.length ? `Ayarlı ortam değişkenleri: ${configured.join(", ")}` : "Seçici ve zaman aşımı varsayılanları kullanılıyor" });
-log({ level: "info", step: "config", event: "timeouts", message: `Zaman aşımları ms: açık=${TIMEOUTS.openLogin}, captcha=${TIMEOUTS.captcha}, cj=${TIMEOUTS.cjButton}, cjTik=${envMs("TIMEOUT_CJ_CLICK", 20000)}, proxy=${PROXY_URL ? "var" : "yok"}` });
+log({ level: "info", step: "config", event: "timeouts", message: `Zaman aşımları ms: açık=${TIMEOUTS.openLogin}, captcha=${TIMEOUTS.captcha}, cj=${TIMEOUTS.cjButton}, cjTik=${envMs("TIMEOUT_CJ_CLICK", 20000)}, cjNav=${cjNavTimeout()}, turnstile=${turnstileTimeout()}, proxy=${PROXY_URL ? "var" : "yok"}` });
 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
