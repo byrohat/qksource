@@ -18,14 +18,15 @@ Arayüz ve API ayrı bir uygulama şifresi istemez.
 3. "We would like to make sure you are not a robot" sayfası çıkarsa oturum durur. Yanıt `{status:"captcha", sessionId, image}` şeklindedir. `image`, doğrulama görselinin base64 PNG ekran görüntüsüdür. Ekran görüntüsü, `img` `complete` olana ve `naturalWidth > 0` olana kadar beklenir; kısa bir gecikmeden sonra alınır. Görsel boşsa resme veya yenile bağlantısına tıklanıp bir kez daha denenir. Sunucu OCR veya dış çözüm servisi kullanmaz.
 4. Operatör kodu yazar. Arayüz `POST /onboard/:sessionId/captcha` ile `{code}` gönderir. Sunucu alanı doldurur, Submit'e basar ve `register.html` yoluna gidişi ya da yeni bir doğrulama görselini bekler. Geçiş sırasında oluşan "Execution context was destroyed" yüzünden akış düşmez. Kod yanlışsa yeni `image` döner.
 5. Kod yanlışsa veya sayfa yeniden doğrulama isterse aynı oturumda yeni bir `image` döner.
-6. "Welcome to Qksource.com" kayıt penceresinde turuncu CJ ikonuna tıklanır. Varsayılan arama: `src` / `href` / `class` / `alt` içinde `cj` geçen öğe, yoksa WhatsApp ikonunun solundaki ilk sosyal ikon. `SEL_CJ_BUTTON` tanımlıysa yalnızca o seçici kullanılır.
-7. CJ penceresi veya yönlendirmesinde e-posta ve şifre yazılır, giriş gönderilir, izin ekranı varsa onaylanır, başarı qksource sayfasında beklenir.
-8. CJ tarafında da doğrulama kodu sayfası çıkarsa aynı duraklama kullanılır.
+6. "Welcome to Qksource.com" kayıt penceresinde turuncu CJ ikonuna tıklanır. İkon, WhatsApp ile aynı satırda ve onun solundaki ilk simgedir (`src` / `href` / `class` / `alt` içinde `cj` varsa o tercih edilir). `SEL_CJ_BUTTON` tanımlıysa yalnızca o seçici kullanılır.
+7. Tıklama `context.waitForEvent('page')`, `page.waitForURL(/cjdropshipping/)` ve alt çerçevelerle birlikte beklenir. Hangisi gelirse CJ girişi orada yapılır: popup, aynı sekmede `cjdropshipping` yönlendirmesi veya iframe. E-posta/kullanıcı adı ve şifre yazılır, giriş gönderilir, izin düğmesi varsa tıklanır, dönüş qksource ana sayfasında beklenir (popup kapanır veya ana sayfa giriş yapılmış hale gelir).
+8. CJ yüzeyi bulunamazsa hata, açık sayfaların ve çerçevelerin adreslerini ve her sayfanın ekran görüntüsünü içerir.
+9. CJ tarafında da doğrulama kodu sayfası çıkarsa aynı duraklama kullanılır.
 
 Tarayıcı oturumu bellekte `sessionId` ile durur. Son işlemden sonra yaklaşık **5 dakika** (`SESSION_TTL_MS`, varsayılan `300000`) içinde kapanır. Başarı veya hatada da kapanır. Aynı anda tek oturum çalışır.
 
 ## Adımlar
-Hata olursa yanıt ve arayüz, başarısız adımı Türkçe söyler. Zaman aşımında mesajın sonuna `(zaman aşımı)` eklenir. Hata yanıtında `url`, `screenshot` (base64 PNG) ve özgün Playwright metni (`detail`) vardır. Adım sarmalayıcısının dışında kalan bir hata da genel bir metne düşmez; `Adım N: ad adı: <err.message>` olarak döner.
+Hata olursa yanıt ve arayüz, başarısız adımı Türkçe söyler. Zaman aşımında mesajın sonuna `(zaman aşımı)` eklenir. Hata yanıtında `url`, her açık sayfanın ekran görüntüsü (`screenshots`) ve özgün Playwright metni (`detail`, açık sayfa ve çerçeve adresleriyle) vardır. Adım sarmalayıcısının dışında kalan bir hata da genel bir metne düşmez; `Adım N: ad adı: <err.message>` olarak döner.
 
 | Adım | Ne yapar | Örnek hata |
 | --- | --- | --- |
@@ -33,7 +34,7 @@ Hata olursa yanıt ve arayüz, başarısız adımı Türkçe söyler. Zaman aş�
 | 2 | Kayıt sayfasını aç | `Adım 2: Kayıt sayfası açılamadı (zaman aşımı)` |
 | 3 | Doğrulama kodunu gönder. CJ ikonundan önce bölge duvarı da burada raporlanır | `Adım 3: Doğrulama kodu alanı bulunamadı` |
 | 4 | CJ ikonuna tıkla | `Adım 4: CJ giriş ikonu bulunamadı` |
-| 5 | Popup veya yönlendirmeyi algıla | `Adım 5: CJ penceresi veya yönlendirme algılanamadı` |
+| 5 | Popup, `cjdropshipping` yönlendirmesi veya iframe | `Adım 5: CJ penceresi veya yönlendirme algılanamadı` |
 | 6 | E-postayı doldur | `Adım 6: CJ e-posta alanı bulunamadı` |
 | 7 | Şifreyi doldur | `Adım 7: CJ şifre alanı bulunamadı` |
 | 8 | Girişi gönder | `Adım 8: CJ giriş formu gönderilemedi` |
@@ -80,7 +81,7 @@ Boş bırakılırsa varsayılan kullanılır. `QK_LOGIN_URL` tanımlıysa `SEL_L
 | `SEL_CAPTCHA_INPUT` | Doğrulama kodu alanı | `placeholder` içinde "verification code" |
 | `SEL_CAPTCHA_SUBMIT` | Doğrulama Submit butonu | `Submit` / `Gönder` yazan buton |
 | `SEL_CAPTCHA` | Ek captcha seçici (reCAPTCHA vb.) | reCAPTCHA, hCaptcha, Turnstile |
-| `SEL_CJ_EMAIL` | CJ e-posta alanı | `input[type="email"], input[name="email"], input[name="username"], input[placeholder*="mail" i]` |
+| `SEL_CJ_EMAIL` | CJ e-posta alanı (popup, yönlendirme veya iframe içinde) | `input[type="email"]`, `username`, `account`, placeholder içinde mail/user |
 | `SEL_CJ_PASSWORD` | CJ şifre alanı | `input[type="password"]` |
 | `SEL_CJ_SUBMIT` | CJ giriş butonu | `button[type="submit"]` ve Sign in / Login |
 | `SEL_CJ_AUTHORIZE` | CJ izin butonu | Authorize / Allow / Agree / Confirm / Yetki butonu |

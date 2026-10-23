@@ -106,7 +106,7 @@ const CAPTCHA_WIDGETS = envStr("SEL_CAPTCHA", "")
 
 const SEL = {
   loginUrl: envStr("QK_LOGIN_URL", envStr("SEL_LOGIN_URL", "https://qksource.com/register.html")),
-  cjEmail: envStr("SEL_CJ_EMAIL", 'input[type="email"], input[name="email"], input[name="username"], input[placeholder*="mail" i]'),
+  cjEmail: envStr("SEL_CJ_EMAIL", 'input[type="email"], input[name="email" i], input[name="username" i], input[name="account" i], input[placeholder*="mail" i], input[placeholder*="user" i], input[id*="email" i]'),
   cjPassword: envStr("SEL_CJ_PASSWORD", 'input[type="password"]'),
   cjSubmit: envStr("SEL_CJ_SUBMIT", 'button[type="submit"], button:has-text("Sign in"), button:has-text("Login"), button:has-text("Log in")'),
   cjAuthorize: envStr("SEL_CJ_AUTHORIZE", "button:has-text('Authorize'), button:has-text('Allow'), button:has-text('Agree'), button:has-text('Confirm'), button:has-text('Yetki')"),
@@ -254,7 +254,7 @@ function isTimeout(err) {
 
 function isContextDestroyed(err) {
   const msg = `${err?.name || ""} ${err?.message || ""}`;
-  return /Execution context was destroyed|frame was detached|Navigation failed|Target closed|most likely because of a navigation|Execution context is not available/i.test(msg);
+  return /Execution context was destroyed|frame was detached|Navigation failed|Target closed|most likely because of a navigation|Execution context is not available|not attached to the DOM/i.test(msg);
 }
 
 function isMissing(err) {
@@ -284,7 +284,8 @@ function messageFor(step, err) {
   if (err?.code === "bad-proxy") return `Adım ${n}: PROXY_URL geçersiz`;
   if (err?.blockerKind === "credentials") return `Adım ${n}: CJ kimlik bilgileri reddedildi`;
   if (err?.code === "bad-url") return `Adım ${n}: Kayıt adresi geçersiz (QK_LOGIN_URL)`;
-  if (err?.code === "no-redirect") return `Adım ${n}: CJ penceresi veya yönlendirme algılanamadı`;
+  if (err?.code === "no-redirect") return `Adım ${n}: CJ penceresi veya yönlendirme algılanamadı. ${err.surfaces || ""}`.trim();
+  if (err?.code === "not-left") return `Adım ${n}: CJ ikonu WhatsApp'ın solunda değil${err.position ? ` (${err.position})` : ""}`;
   if (isBadSelector(err)) return `Adım ${n}: seçici geçersiz (${step.selectorEnv || "seçici"})`;
   if (step.id === "browser") {
     return isTimeout(err) ? `Adım ${n}: Tarayıcı başlatılamadı (zaman aşımı)` : `Adım ${n}: Tarayıcı başlatılamadı`;
@@ -758,23 +759,38 @@ function findCjInDocument() {
     const s = getComputedStyle(el);
     return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
   };
-  const nodes = [...document.querySelectorAll("img, a, button, [role='button'], svg, i, span")];
-  const cj = nodes.find((el) => visible(el) && /cj/i.test(textOf(el)));
-  if (cj) return cj.closest("a, button, [role='button']") || cj;
+  const nodes = [...document.querySelectorAll("img, svg, i, span, a, button, [role='button']")];
   const wa = nodes.find((el) => visible(el) && /whatsapp/i.test(textOf(el)));
-  if (!wa) return null;
-  let row = wa.parentElement;
-  for (let i = 0; i < 5 && row; i += 1) {
-    if (row.children.length >= 4) break;
-    row = row.parentElement;
+  const clickable = (el) => {
+    const host = el.closest?.("a, button, [role='button']");
+    if (!host) return el;
+    if (wa && host.contains(wa) && host !== el) return el;
+    return host;
+  };
+  if (wa) {
+    let row = wa.parentElement;
+    for (let i = 0; i < 6 && row; i += 1) {
+      const icons = [...row.querySelectorAll("img, svg")].filter(visible);
+      if (icons.length >= 4) break;
+      row = row.parentElement;
+    }
+    const wr = wa.getBoundingClientRect();
+    const left = [...(row?.querySelectorAll("a, button, img, svg, span, i") || [])]
+      .filter((el) => visible(el) && el !== wa && !el.contains(wa))
+      .map((el) => ({ el, r: el.getBoundingClientRect() }))
+      .filter(({ r }) => r.width > 8 && r.height > 8 && r.right <= wr.left + 8)
+      .filter(({ r }) => Math.abs((r.top + r.bottom) / 2 - (wr.top + wr.bottom) / 2) < Math.max(48, wr.height * 1.5))
+      .sort((a, b) => a.r.left - b.r.left);
+    const marked = left.find(({ el }) => /cj/i.test(textOf(el)));
+    const chosen = (marked || left[0])?.el;
+    if (chosen) return clickable(chosen);
   }
-  const first = row?.children?.[0];
-  if (!first || first === wa || first.contains(wa)) return null;
-  return first.querySelector("img, a, button") || first;
+  const cj = nodes.find((el) => visible(el) && /cj/i.test(textOf(el)) && !/whatsapp/i.test(textOf(el)));
+  return cj ? clickable(cj) : null;
 }
 
 async function findCj(page) {
-  for (const frame of page.frames()) {
+  for (const frame of safeFrames(page)) {
     let handle;
     try {
       handle = await frame.evaluateHandle(findCjInDocument);
@@ -786,6 +802,134 @@ async function findCj(page) {
     await handle.dispose().catch(() => {});
   }
   return null;
+}
+
+async function positionAgainstWhatsapp(el) {
+  return el.evaluate((node) => {
+    const textOf = (item) => {
+      const cls = typeof item.className === "string" ? item.className : (item.getAttribute?.("class") || "");
+      return [item.getAttribute?.("src"), item.getAttribute?.("href"), item.getAttribute?.("alt"), item.getAttribute?.("aria-label"), item.getAttribute?.("title"), cls].filter(Boolean).join(" ");
+    };
+    const visible = (item) => {
+      if (!item?.getClientRects?.().length) return false;
+      const s = getComputedStyle(item);
+      return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
+    };
+    const wa = [...document.querySelectorAll("img, svg, i, span, a, button")].find((item) => visible(item) && /whatsapp/i.test(textOf(item)));
+    if (!wa) return { ok: true, reason: "whatsapp-yok" };
+    const wr = wa.getBoundingClientRect();
+    const er = node.getBoundingClientRect();
+    const sameRow = Math.abs((er.top + er.bottom) / 2 - (wr.top + wr.bottom) / 2) < Math.max(48, wr.height * 1.5);
+    const left = er.right <= wr.left + 8;
+    return { ok: sameRow && left, left: Math.round(er.left), wa: Math.round(wr.left), sameRow };
+  });
+}
+
+function isCjUrl(url) {
+  return /cjdropshipping|cj\.com/i.test(String(url || ""));
+}
+
+async function describeSurfaces(session) {
+  const lines = [];
+  const pages = session?.context?.pages?.() || [];
+  for (const p of pages) {
+    const url = pageOpen(p) ? (currentUrl(p) || "(boş)") : "(kapalı)";
+    lines.push(`${p === session.page ? "ana" : "pencere"}: ${url}`);
+    for (const frame of safeFrames(p)) {
+      let frameUrl = "";
+      try { frameUrl = frame.url(); } catch { continue; }
+      if (frameUrl && frameUrl !== url) lines.push(`çerçeve: ${frameUrl}`);
+    }
+  }
+  return lines.length ? lines.join(" | ") : "açık sayfa yok";
+}
+
+async function collectPageShots(session) {
+  const shots = [];
+  const pages = session?.context?.pages?.() || [];
+  for (const p of pages) {
+    if (!pageOpen(p) || shots.length >= 4) continue;
+    const url = currentUrl(p);
+    const image = await takeScreenshot(p);
+    if (image) shots.push({ url, image });
+  }
+  return shots;
+}
+
+function startCjWatch(session, timeout) {
+  const page = session.page;
+  const startUrl = page.url();
+  const seen = { popup: null };
+  const popupWait = session.context.waitForEvent("page", { timeout }).then((popup) => {
+    seen.popup = popup;
+    return popup;
+  }).catch(() => null);
+  const urlWait = page.waitForURL(/cjdropshipping/i, { timeout, waitUntil: "domcontentloaded" }).then(() => true).catch(() => false);
+  return (async () => {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const popup = seen.popup;
+      if (popup && pageOpen(popup)) {
+        const popupUrl = currentUrl(popup) || "";
+        if (popupUrl && popupUrl !== "about:blank") return { kind: "popup", page: popup };
+      }
+      for (const candidate of session.context.pages()) {
+        if (candidate === page || !pageOpen(candidate)) continue;
+        const candidateUrl = currentUrl(candidate) || "";
+        if (isCjUrl(candidateUrl) || (candidateUrl && candidateUrl !== "about:blank")) return { kind: "popup", page: candidate };
+      }
+      const mainUrl = currentUrl(page) || "";
+      if (isCjUrl(mainUrl) || (pathOf(mainUrl) && pathOf(mainUrl) !== pathOf(startUrl))) return { kind: "redirect", page };
+      for (const frame of safeFrames(page)) {
+        if (frame === page.mainFrame()) continue;
+        let frameUrl = "";
+        try { frameUrl = frame.url(); } catch { continue; }
+        if (!frameUrl || frameUrl === "about:blank") continue;
+        if (isCjUrl(frameUrl) || /cjdropshipping/i.test(frameUrl)) return { kind: "frame", frame, page };
+        const emailVisible = await frame.locator(SEL.cjEmail).first().isVisible().catch(() => false);
+        if (emailVisible) return { kind: "frame", frame, page };
+      }
+      await delay(250);
+    }
+    await popupWait;
+    await urlWait;
+    if (seen.popup && pageOpen(seen.popup)) return { kind: "popup", page: seen.popup };
+    return null;
+  })();
+}
+
+async function loginRoots(session) {
+  const roots = [];
+  const pushPage = (p) => {
+    if (!pageOpen(p)) return;
+    for (const frame of safeFrames(p)) roots.push(frame);
+  };
+  if (session.loginFrame) roots.push(session.loginFrame);
+  if (session.cjKind === "popup") pushPage(session.popup || session.active);
+  else if (session.cjKind === "frame") pushPage(session.page);
+  else pushPage(session.active || session.page);
+  return roots;
+}
+
+async function loginLocator(session, selector, timeout) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await isCaptchaPage(session.active || session.page).catch(() => false)) {
+      const pause = new Error("captcha");
+      pause.captchaPause = true;
+      throw pause;
+    }
+    for (const root of await loginRoots(session)) {
+      const loc = root.locator(selector).first();
+      if (await loc.isVisible().catch(() => false)) return loc;
+    }
+    await delay(300);
+  }
+  const surfaces = await describeSurfaces(session);
+  const err = new Error(`Timeout ${timeout}ms exceeded waiting for ${selector}. ${surfaces}`);
+  err.name = "TimeoutError";
+  err.surfaces = surfaces;
+  throw err;
 }
 
 function publicDetail(err) {
@@ -856,11 +1000,11 @@ async function runStep(ctx, step, fn) {
     if (credentials) err.blockerKind = "credentials";
     const message = messageFor(step, err);
     const url = currentUrl(ctx.active) || currentUrl(ctx.page);
-    const screenshot = await withDeadline(
-      async () => (await takeScreenshot(ctx.active)) || (await takeScreenshot(ctx.page)),
-      6000,
-    ).catch(() => null);
+    const surfaces = await describeSurfaces(ctx).catch(() => "");
+    const shots = await collectPageShots(ctx).catch(() => []);
+    const screenshot = shots.find((shot) => shot.image)?.image || null;
     const kind = blockerKindOf(step, err);
+    const detailText = [publicDetail(err), surfaces].filter(Boolean).join(" | ");
     log({
       level: "error",
       step: step.id,
@@ -871,7 +1015,7 @@ async function runStep(ctx, step, fn) {
       sessionId: ctx.id,
       url,
       message,
-      detail: err?.message,
+      detail: detailText || err?.message,
       blocker: kind,
     });
     const wrapped = new Error(message);
@@ -880,8 +1024,9 @@ async function runStep(ctx, step, fn) {
     wrapped.stepNo = step.n;
     wrapped.url = url ? redact(url, 500) : null;
     wrapped.screenshot = screenshot;
+    wrapped.screenshots = shots;
     wrapped.blocker = kind;
-    wrapped.detail = publicDetail(err);
+    wrapped.detail = detailText || null;
     throw wrapped;
   }
 }
@@ -987,8 +1132,7 @@ const STEP_FNS = {
         if (isTimeout(err) || isMissing(err)) err.code = "missing-button";
         throw err;
       }
-      session.pendingPopup = session.context.waitForEvent("page", { timeout: TIMEOUTS.popup }).catch(() => null);
-      await btn.click({ timeout: TIMEOUTS.cjButton });
+      session.cjClick = () => btn.click({ timeout: TIMEOUTS.cjButton, noWaitAfter: true });
       return;
     }
     const deadline = Date.now() + TIMEOUTS.cjButton;
@@ -999,70 +1143,78 @@ const STEP_FNS = {
       await delay(200);
     }
     if (!el) throw Object.assign(new Error("missing-button"), { code: "missing-button" });
-    session.pendingPopup = session.context.waitForEvent("page", { timeout: TIMEOUTS.popup }).catch(() => null);
-    try {
-      await el.click({ timeout: TIMEOUTS.cjButton });
-    } finally {
+    const position = await positionAgainstWhatsapp(el).catch(() => ({ ok: true, reason: "whatsapp-yok" }));
+    if (position && position.ok === false) {
       await el.dispose().catch(() => {});
+      throw Object.assign(new Error("not-left"), { code: "not-left", position: `ikon x=${position.left}, WhatsApp x=${position.wa}` });
     }
+    session.cjClick = async () => {
+      try {
+        await el.click({ timeout: TIMEOUTS.cjButton, noWaitAfter: true });
+      } finally {
+        await el.dispose().catch(() => {});
+      }
+    };
   },
   async popup(session) {
-    const popup = await session.pendingPopup;
-    session.pendingPopup = null;
-    session.popup = popup || null;
-    if (popup) {
-      session.active = popup;
-      await withNavRetry(session, STEPS.popup, () => popup.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }), {
-        timeoutMs: TIMEOUTS.navigation,
-      });
-      log({
-        level: "info",
-        step: STEPS.popup.id,
-        stepNo: STEPS.popup.n,
-        stepName: STEPS.popup.name,
-        event: "popup",
-        email: session.email,
-        sessionId: session.id,
-        url: currentUrl(popup),
-        message: "CJ penceresi açıldı",
-      });
-      return;
+    const timeout = Math.max(TIMEOUTS.popup, TIMEOUTS.navigation);
+    const watch = startCjWatch(session, timeout);
+    let target = null;
+    const clickTask = Promise.resolve().then(() => session.cjClick?.()).catch((err) => {
+      if (isContextDestroyed(err)) return null;
+      throw err;
+    });
+    try {
+      [target] = await Promise.all([watch, clickTask]);
+    } catch (err) {
+      target = await Promise.race([watch, delay(1500).then(() => null)]);
+      if (!target) throw err;
     }
-    session.active = session.page;
-    await session.page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }).catch(() => {});
-    const stillRegister = await session.page.locator("text=/Create a Qksource account|Confirm Password/i").first().isVisible().catch(() => false);
-    const url = currentUrl(session.page) || "";
-    if (stillRegister && !/cjdropshipping|cj\.com/i.test(url)) {
-      throw Object.assign(new Error("no-redirect"), { code: "no-redirect" });
+    if (!target) {
+      throw Object.assign(new Error("no-redirect"), { code: "no-redirect", surfaces: await describeSurfaces(session) });
+    }
+    session.cjKind = target.kind;
+    if (target.kind === "popup") {
+      session.popup = target.page;
+      session.active = target.page;
+      await target.page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }).catch((err) => {
+        if (!isContextDestroyed(err) && !isTimeout(err)) throw err;
+      });
+    } else if (target.kind === "frame") {
+      session.loginFrame = target.frame;
+      session.active = target.page;
+    } else {
+      session.active = target.page;
+      await target.page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }).catch(() => {});
     }
     log({
       level: "info",
       step: STEPS.popup.id,
       stepNo: STEPS.popup.n,
       stepName: STEPS.popup.name,
-      event: "same-tab",
+      event: target.kind,
       email: session.email,
       sessionId: session.id,
-      url,
-      message: "Aynı sekmede devam ediliyor",
+      url: target.kind === "frame" ? target.frame.url() : currentUrl(target.page),
+      message: target.kind === "popup" ? "CJ penceresi açıldı" : target.kind === "frame" ? "CJ çerçevesi bulundu" : "CJ sayfasına geçildi",
     });
   },
   async email(session) {
-    const page = session.active;
-    await page.locator(SEL.cjEmail).first().fill(session.email, { timeout: TIMEOUTS.email });
+    const field = await loginLocator(session, SEL.cjEmail, TIMEOUTS.email);
+    await field.fill(session.email, { timeout: TIMEOUTS.email });
   },
   async password(session) {
-    const page = session.active;
-    await page.locator(SEL.cjPassword).first().fill(session.password, { timeout: TIMEOUTS.password });
+    const field = await loginLocator(session, SEL.cjPassword, TIMEOUTS.password);
+    await field.fill(session.password, { timeout: TIMEOUTS.password });
   },
   async submit(session) {
-    const page = session.active;
+    const button = await loginLocator(session, SEL.cjSubmit, TIMEOUTS.submit);
     try {
-      await page.locator(SEL.cjSubmit).first().click({ timeout: TIMEOUTS.submit });
+      await button.click({ timeout: TIMEOUTS.submit, noWaitAfter: true });
     } catch (err) {
-      if (!pageOpen(page)) return;
-      throw err;
+      if (!isContextDestroyed(err)) throw err;
     }
+    const page = pageOpen(session.active) ? session.active : session.page;
     if (pageOpen(page)) {
       await page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.submit }).catch(() => {});
       await delay(300);
@@ -1071,16 +1223,25 @@ const STEP_FNS = {
   },
   async authorize(session) {
     if (!pageOpen(session.active)) session.active = session.page;
-    if (pageOpen(session.active)) {
-      const auth = session.active.locator(SEL.cjAuthorize).first();
-      let visible = false;
-      try {
-        await auth.waitFor({ state: "visible", timeout: TIMEOUTS.authorize });
-        visible = true;
-      } catch (err) {
-        if (!isTimeout(err)) throw err;
+    if (pageOpen(session.active) || session.popup) {
+      const deadline = Date.now() + TIMEOUTS.authorize;
+      let auth = null;
+      while (!auth && Date.now() < deadline) {
+        for (const candidate of session.context?.pages?.() || []) {
+          for (const frame of safeFrames(candidate)) {
+            const loc = frame.locator(SEL.cjAuthorize).first();
+            if (await loc.isVisible().catch(() => false)) {
+              auth = loc;
+              break;
+            }
+          }
+          if (auth) break;
+        }
+        if (!auth) await delay(250);
       }
-      if (visible) await auth.click({ timeout: TIMEOUTS.authorize });
+      if (auth) await auth.click({ timeout: TIMEOUTS.authorize, noWaitAfter: true }).catch((err) => {
+        if (!isContextDestroyed(err)) throw err;
+      });
       else {
         log({
           level: "info",
@@ -1290,16 +1451,20 @@ function failureBody(err, session) {
   if (err?.code === "expired" || session?.closing) {
     return { ok: false, status: "error", error: "Oturum bulunamadı veya süresi doldu", step: "session", url: null, screenshot: shot, blocker: null, detail: null };
   }
+  const screenshots = Array.isArray(err?.screenshots) && err.screenshots.length
+    ? err.screenshots
+    : (shot ? [{ url: safeUrl, image: shot }] : []);
   if (err?.handled) {
     return {
       ok: false,
       status: "error",
-      error: redact(err.message, 500),
+      error: redact(err.message, 1500),
       step: err.stepId,
       url: safeUrl,
-      screenshot: shot,
+      screenshot: screenshots[0]?.image || shot,
+      screenshots,
       blocker: err.blocker ?? null,
-      detail: err.detail || null,
+      detail: err.detail ? redact(err.detail, 1500) : null,
     };
   }
   const step = session?.currentStep;
@@ -1311,7 +1476,8 @@ function failureBody(err, session) {
     error,
     step: step?.id || "onboard",
     url: safeUrl,
-    screenshot: shot,
+    screenshot: screenshots[0]?.image || shot,
+    screenshots,
     blocker: null,
     detail,
   };
@@ -1506,7 +1672,7 @@ function show(j){
     r.innerHTML='<p class="hint">Oturum açık. Kodu gönderin.</p>';return;}
   cap.hidden=true;sessionId=null;
   if(j&&j.ok){r.innerHTML='<p class="ok">✅ Başarılı</p><p>Son URL: '+esc(j.url)+'</p>';}
-  else{var detail=(j&&j.detail&&j.detail!==j.error)?'<p>'+esc(j.detail)+'</p>':'';r.innerHTML='<p class="err">❌ Hata: '+esc((j&&j.error)||'yanıt yok')+'</p>'+detail+(j&&j.url?'<p>URL: '+esc(j.url)+'</p>':'')+(j&&j.screenshot?'<img alt="Hata ekran görüntüsü" src="data:image/png;base64,'+String(j.screenshot).replace(/[^A-Za-z0-9+/=]/g,'')+'">':'');}
+  else{var detail=(j&&j.detail&&j.detail!==j.error)?'<p>'+esc(j.detail)+'</p>':'';var shots=(j&&j.screenshots)||[];if(!shots.length&&j&&j.screenshot)shots=[{url:j.url,image:j.screenshot}];var imgs=shots.filter(function(s){return s&&s.image;}).map(function(s){return '<p>'+esc(s.url||'sayfa')+'</p><img alt="Sayfa" src="data:image/png;base64,'+String(s.image).replace(/[^A-Za-z0-9+/=]/g,'')+'">';}).join('');r.innerHTML='<p class="err">❌ Hata: '+esc((j&&j.error)||'yanıt yok')+'</p>'+detail+(j&&j.url?'<p>URL: '+esc(j.url)+'</p>':'')+imgs;}
   b.disabled=false;b.textContent='Başlat';
 }
 f.onsubmit=async e=>{e.preventDefault();b.disabled=true;b.textContent='Çalışıyor...';r.innerHTML='';cap.hidden=true;
