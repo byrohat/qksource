@@ -9,9 +9,23 @@ const warned = new Set();
 const sessions = new Map();
 let activeSessionId = null;
 
+function proxyRedactions() {
+  const raw = typeof process.env.PROXY_URL === "string" ? process.env.PROXY_URL.trim() : "";
+  if (!raw) return [];
+  const list = [raw];
+  try {
+    const url = new URL(raw);
+    const password = url.password ? decodeURIComponent(url.password) : "";
+    if (password.length >= 4) list.push(password);
+  } catch {
+    // PROXY_URL ayrışmazsa yalnızca ham değer gizlenir.
+  }
+  return list;
+}
+
 function redact(text, limit = 0) {
   let s = String(text ?? "");
-  for (const secret of activeSecrets) {
+  for (const secret of [...activeSecrets, ...proxyRedactions()]) {
     if (secret) s = s.split(String(secret)).join("[REDACTED]");
   }
   s = s.replace(/\s+/g, " ").trim();
@@ -115,6 +129,12 @@ const TIMEOUTS = {
 
 const SESSION_TTL = envMs("SESSION_TTL_MS", 5 * 60 * 1000);
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const BROWSER_LOCALE = envStr("BROWSER_LOCALE", "de-DE");
+const BROWSER_TZ = envStr("BROWSER_TZ", "Europe/Berlin");
+const BROWSER_UA = envStr("BROWSER_UA", "");
+const PROXY_URL = envStr("PROXY_URL", "");
+const GEO_ERROR = "Adım 3: qksource bölge engeli (Avrupa dışı erişim). PROXY_URL ile Avrupa proxy'si tanımlayın.";
+const GEO_TEXT = /only accessible to European sites/i;
 
 const STEPS = {
   browser: {
@@ -134,6 +154,15 @@ const STEPS = {
     timeoutLabel: "Kayıt sayfası açılamadı",
     missingLabel: "Kayıt sayfası açılamadı",
     genericLabel: "Kayıt sayfası açılamadı",
+  },
+  geo: {
+    n: 3,
+    id: "geo",
+    name: "Bölge erişimini kontrol et",
+    selectorEnv: "PROXY_URL",
+    timeoutLabel: "qksource bölge engeli (Avrupa dışı erişim). PROXY_URL ile Avrupa proxy'si tanımlayın",
+    missingLabel: "qksource bölge engeli (Avrupa dışı erişim). PROXY_URL ile Avrupa proxy'si tanımlayın",
+    genericLabel: "qksource bölge engeli (Avrupa dışı erişim). PROXY_URL ile Avrupa proxy'si tanımlayın",
   },
   captcha: {
     n: 3,
@@ -227,7 +256,7 @@ function isBadSelector(err) {
 }
 
 function isTransientNavigation(err) {
-  if (!err || err.blockerKind || err.handled || err.captchaPause || err.code === "bad-url" || isBadSelector(err)) return false;
+  if (!err || err.blockerKind || err.handled || err.captchaPause || err.code === "bad-url" || err.code === "geo" || err.code === "bad-proxy" || isBadSelector(err)) return false;
   const msg = `${err.name || ""} ${err.message || ""}`;
   return /TimeoutError|timeout|timed out|net::ERR_|NS_ERROR_|frame was detached|Execution context was destroyed|Navigation failed|ERR_CONNECTION|ERR_NETWORK|ERR_ABORTED|ERR_EMPTY_RESPONSE|ECONNRESET|ECONNREFUSED|socket hang up/i.test(msg);
 }
@@ -241,6 +270,8 @@ function blockerError(kind) {
 
 function messageFor(step, err) {
   const n = step.n;
+  if (err?.blockerKind === "geo" || err?.code === "geo") return GEO_ERROR;
+  if (err?.code === "bad-proxy") return `Adım ${n}: PROXY_URL geçersiz`;
   if (err?.blockerKind === "credentials") return `Adım ${n}: CJ kimlik bilgileri reddedildi`;
   if (err?.code === "bad-url") return `Adım ${n}: Kayıt adresi geçersiz (QK_LOGIN_URL)`;
   if (err?.code === "no-redirect") return `Adım ${n}: CJ penceresi veya yönlendirme algılanamadı`;
@@ -257,6 +288,7 @@ function messageFor(step, err) {
 }
 
 function blockerKindOf(step, err) {
+  if (err?.blockerKind === "geo" || err?.code === "geo") return "geo";
   if (err?.blockerKind === "credentials") return "credentials";
   if (isBadSelector(err)) return "selector";
   if (isTimeout(err)) return "timeout";
@@ -463,6 +495,70 @@ function isHttpUrl(value) {
   }
 }
 
+function acceptLanguage(locale) {
+  const clean = String(locale || "de-DE").trim() || "de-DE";
+  const base = clean.split("-")[0];
+  if (!base || base.toLowerCase() === clean.toLowerCase()) return `${clean},en;q=0.8`;
+  return `${clean},${base};q=0.9,en;q=0.8`;
+}
+
+function desktopChromeUa(version) {
+  const match = String(version || "").match(/\d+\.\d+\.\d+(?:\.\d+)?/);
+  const v = match ? match[0] : "131.0.0.0";
+  return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${v} Safari/537.36`;
+}
+
+function parseProxyUrl(raw) {
+  if (!raw) return null;
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw Object.assign(new Error("bad-proxy"), { code: "bad-proxy" });
+  }
+  const allowed = new Set(["http:", "https:", "socks5:", "socks4:"]);
+  if (!allowed.has(url.protocol) || !url.hostname) {
+    throw Object.assign(new Error("bad-proxy"), { code: "bad-proxy" });
+  }
+  const proxy = { server: `${url.protocol}//${url.hostname}${url.port ? `:${url.port}` : ""}` };
+  if (url.username) proxy.username = decodeURIComponent(url.username);
+  if (url.password) proxy.password = decodeURIComponent(url.password);
+  return proxy;
+}
+
+async function launchChromium() {
+  const proxy = parseProxyUrl(PROXY_URL);
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage", ...(proxy ? ["--proxy-bypass-list=<-loopback>"] : [])],
+    ...(proxy ? { proxy } : {}),
+  });
+  const language = acceptLanguage(BROWSER_LOCALE);
+  const context = await browser.newContext({
+    locale: BROWSER_LOCALE,
+    timezoneId: BROWSER_TZ,
+    userAgent: BROWSER_UA || desktopChromeUa(browser.version()),
+    viewport: { width: 1366, height: 768 },
+    extraHTTPHeaders: { "Accept-Language": language },
+  });
+  // Chromium, locale yüzünden Accept-Language'i tek etikete indirir. İsteklerde tam listeyi geri yazarız.
+  await context.route("**/*", async (route) => {
+    const headers = { ...route.request().headers(), "accept-language": language };
+    await route.continue({ headers });
+  });
+  return { browser, context };
+}
+
+async function isGeoBlocked(page) {
+  if (!pageOpen(page)) return false;
+  try {
+    const text = await page.locator("body").innerText({ timeout: 2000 });
+    return GEO_TEXT.test(text);
+  } catch {
+    return false;
+  }
+}
+
 function findCjInDocument() {
   const textOf = (el) => {
     const cls = typeof el.className === "string" ? el.className : (el.getAttribute?.("class") || "");
@@ -639,10 +735,15 @@ async function drive(session) {
     if (session.closing) throw Object.assign(new Error("expired"), { code: "expired" });
     const page = pageOpen(session.active) ? session.active : session.page;
     session.active = page;
+    const key = PHASES[session.phaseIndex];
+    if (key === "cjButton") {
+      await runStep(session, STEPS.geo, async () => {
+        if (await isGeoBlocked(session.page)) throw Object.assign(new Error("geo"), { code: "geo", blockerKind: "geo" });
+      });
+    }
     if (await isCaptchaPage(page)) {
       return captchaResult(session, await captureCaptchaImage(page));
     }
-    const key = PHASES[session.phaseIndex];
     try {
       await runStep(session, STEPS[key], () => STEP_FNS[key](session));
     } catch (err) {
@@ -825,11 +926,9 @@ const STEP_FNS = {
 
 async function openRegister(session) {
   await runStep(session, STEPS.browser, async () => {
-    session.browser = await chromium.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
-    });
-    session.context = await session.browser.newContext({ viewport: { width: 1280, height: 900 } });
+    const launched = await launchChromium();
+    session.browser = launched.browser;
+    session.context = launched.context;
     session.page = await session.context.newPage();
     session.active = session.page;
   });
@@ -902,15 +1001,59 @@ async function withSessionSecrets(session, code, fn) {
   }
 }
 
-const configured = ["QK_LOGIN_URL", "SEL_LOGIN_URL", "SEL_CJ_BUTTON", "SEL_CJ_EMAIL", "SEL_CJ_PASSWORD", "SEL_CJ_SUBMIT", "SEL_CJ_AUTHORIZE", "SEL_SUCCESS", "SEL_ERROR_TEXT", "SEL_CAPTCHA", "SEL_CAPTCHA_INPUT", "SEL_CAPTCHA_SUBMIT", "SEL_CAPTCHA_IMAGE", "TIMEOUT_OPEN_LOGIN", "TIMEOUT_CAPTCHA", "TIMEOUT_CJ_BUTTON", "TIMEOUT_POPUP", "TIMEOUT_NAVIGATION", "TIMEOUT_EMAIL", "TIMEOUT_PASSWORD", "TIMEOUT_SUBMIT", "TIMEOUT_AUTHORIZE", "TIMEOUT_SUCCESS", "SESSION_TTL_MS"]
+const configured = ["QK_LOGIN_URL", "SEL_LOGIN_URL", "SEL_CJ_BUTTON", "SEL_CJ_EMAIL", "SEL_CJ_PASSWORD", "SEL_CJ_SUBMIT", "SEL_CJ_AUTHORIZE", "SEL_SUCCESS", "SEL_ERROR_TEXT", "SEL_CAPTCHA", "SEL_CAPTCHA_INPUT", "SEL_CAPTCHA_SUBMIT", "SEL_CAPTCHA_IMAGE", "BROWSER_LOCALE", "BROWSER_TZ", "BROWSER_UA", "PROXY_URL", "TIMEOUT_OPEN_LOGIN", "TIMEOUT_CAPTCHA", "TIMEOUT_CJ_BUTTON", "TIMEOUT_POPUP", "TIMEOUT_NAVIGATION", "TIMEOUT_EMAIL", "TIMEOUT_PASSWORD", "TIMEOUT_SUBMIT", "TIMEOUT_AUTHORIZE", "TIMEOUT_SUCCESS", "SESSION_TTL_MS"]
   .filter((name) => typeof process.env[name] === "string" && process.env[name].trim() !== "");
 log({ level: "info", step: "config", event: "env", message: configured.length ? `Ayarlı ortam değişkenleri: ${configured.join(", ")}` : "Seçici ve zaman aşımı varsayılanları kullanılıyor" });
 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
 
+let debugRunning = false;
+
 app.get("/healthz", (_req, res) => {
   res.status(200).type("text/plain; charset=utf-8").send("ok");
+});
+
+app.get("/debug/ip", async (_req, res) => {
+  if (sessions.size > 0 || debugRunning) {
+    return res.status(429).json({ ok: false, error: "Başka bir işlem sürüyor, biraz sonra deneyin" });
+  }
+  debugRunning = true;
+  let browser = null;
+  try {
+    const body = await withSessionSecrets(null, null, async () => {
+      const launched = await launchChromium();
+      browser = launched.browser;
+      const response = await launched.context.request.get("https://ipapi.co/json", {
+        timeout: 20000,
+        headers: { "Accept-Language": acceptLanguage(BROWSER_LOCALE) },
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok() || !data || data.error || !data.ip) {
+        const reason = data?.reason || data?.message || `HTTP ${response.status()}`;
+        throw Object.assign(new Error(String(reason)), { code: "ip-lookup" });
+      }
+      return {
+        ip: data.ip,
+        country: data.country_name || data.country || null,
+        countryCode: data.country || null,
+      };
+    });
+    res.json(body);
+  } catch (err) {
+    const message = err?.code === "bad-proxy" ? "PROXY_URL geçersiz" : "IP sorgusu başarısız";
+    log({
+      level: "error",
+      step: "debug-ip",
+      event: "fail",
+      message,
+      detail: err?.message,
+    });
+    res.status(err?.code === "bad-proxy" ? 400 : 502).json({ ok: false, error: message });
+  } finally {
+    debugRunning = false;
+    await closeBrowser(browser);
+  }
 });
 
 app.post("/onboard", async (req, res) => {
@@ -918,7 +1061,7 @@ app.post("/onboard", async (req, res) => {
   if (typeof cjEmail !== "string" || typeof cjPassword !== "string" || cjEmail.length === 0 || cjPassword.length === 0) {
     return res.status(400).json({ ok: false, status: "error", error: "CJ e-posta ve şifre gerekli" });
   }
-  if (sessions.size > 0) {
+  if (sessions.size > 0 || debugRunning) {
     log({ level: "warn", step: "onboard", event: "busy", email: cjEmail, message: "Başka bir işlem sürüyor" });
     return res.status(429).json({ ok: false, status: "error", error: "Başka bir işlem sürüyor, biraz sonra deneyin" });
   }

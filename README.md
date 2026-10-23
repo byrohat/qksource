@@ -7,18 +7,20 @@ Arayüz ve API ayrı bir uygulama şifresi istemez.
 ## Render'a kurulum
 1. Render → **New → Blueprint** → bu repoyu seç (`render.yaml` otomatik okunur). Ya da **New → Web Service → Docker** seç.
 2. Plan: en az **Starter** (Chromium için ücretsiz plan belleği yetmeyebilir).
-3. Seçiciler ve adım zaman aşımları aşağıda. Canlı sitede ikon veya alan farklıysa kod değiştirmeden Render env ile düzeltin.
-4. Deploy sonrası servis URL'ini açın, formu doldurup **Başlat**'a basın. Doğrulama resmi gelirse kodu yazıp **Gönder**'e basın.
-5. Sağlık kontrolü `GET /healthz` (gövde `ok`). `render.yaml` bunu kullanır.
+3. Seçiciler, tarayıcı bölgesi ve adım zaman aşımları aşağıda. Canlı sitede ikon veya alan farklıysa kod değiştirmeden Render env ile düzeltin.
+4. Frankfurt çıkışı "only accessible to European sites" sayfasını görürse `PROXY_URL` ile bir Avrupa proxy'si tanımlayın. Kontrol: `GET /debug/ip`.
+5. Deploy sonrası servis URL'ini açın, formu doldurup **Başlat**'a basın. Doğrulama resmi gelirse kodu yazıp **Gönder**'e basın.
+6. Sağlık kontrolü `GET /healthz` (gövde `ok`). `render.yaml` bunu kullanır.
 
 ## Akış
-1. `https://qksource.com/register.html` açılır.
-2. "We would like to make sure you are not a robot" sayfası çıkarsa oturum durur. Yanıt `{status:"captcha", sessionId, image}` şeklindedir. `image`, doğrulama görselinin base64 PNG ekran görüntüsüdür. Sunucu OCR veya dış çözüm servisi kullanmaz.
-3. Operatör kodu yazar. Arayüz `POST /onboard/:sessionId/captcha` ile `{code}` gönderir. Sunucu alanı doldurur ve Submit'e basar.
-4. Kod yanlışsa veya sayfa yeniden doğrulama isterse aynı oturumda yeni bir `image` döner.
-5. "Welcome to Qksource.com" kayıt penceresinde turuncu CJ ikonuna tıklanır. Varsayılan arama: `src` / `href` / `class` / `alt` içinde `cj` geçen öğe, yoksa WhatsApp ikonunun solundaki ilk sosyal ikon. `SEL_CJ_BUTTON` tanımlıysa yalnızca o seçici kullanılır.
-6. CJ penceresi veya yönlendirmesinde e-posta ve şifre yazılır, giriş gönderilir, izin ekranı varsa onaylanır, başarı qksource sayfasında beklenir.
-7. CJ tarafında da doğrulama kodu sayfası çıkarsa aynı duraklama kullanılır.
+1. `https://qksource.com/register.html` açılır. Tarayıcı Avrupa yerel ayarıyla başlar: dil `BROWSER_LOCALE` (varsayılan `de-DE`), saat dilimi `BROWSER_TZ` (varsayılan `Europe/Berlin`), buna uyan `Accept-Language`, masaüstü Chrome kullanıcı aracısı (`BROWSER_UA` ile değiştirilebilir) ve 1366×768 pencere. `PROXY_URL` doluysa Chromium bu proxy ile çıkar.
+2. Sayfa "only accessible to European sites" diyorsa CJ ikonuna geçilmez. Yanıt: `Adım 3: qksource bölge engeli (Avrupa dışı erişim). PROXY_URL ile Avrupa proxy'si tanımlayın.`
+3. "We would like to make sure you are not a robot" sayfası çıkarsa oturum durur. Yanıt `{status:"captcha", sessionId, image}` şeklindedir. `image`, doğrulama görselinin base64 PNG ekran görüntüsüdür. Sunucu OCR veya dış çözüm servisi kullanmaz.
+4. Operatör kodu yazar. Arayüz `POST /onboard/:sessionId/captcha` ile `{code}` gönderir. Sunucu alanı doldurur ve Submit'e basar.
+5. Kod yanlışsa veya sayfa yeniden doğrulama isterse aynı oturumda yeni bir `image` döner.
+6. "Welcome to Qksource.com" kayıt penceresinde turuncu CJ ikonuna tıklanır. Varsayılan arama: `src` / `href` / `class` / `alt` içinde `cj` geçen öğe, yoksa WhatsApp ikonunun solundaki ilk sosyal ikon. `SEL_CJ_BUTTON` tanımlıysa yalnızca o seçici kullanılır.
+7. CJ penceresi veya yönlendirmesinde e-posta ve şifre yazılır, giriş gönderilir, izin ekranı varsa onaylanır, başarı qksource sayfasında beklenir.
+8. CJ tarafında da doğrulama kodu sayfası çıkarsa aynı duraklama kullanılır.
 
 Tarayıcı oturumu bellekte `sessionId` ile durur. Son işlemden sonra yaklaşık **5 dakika** (`SESSION_TTL_MS`, varsayılan `300000`) içinde kapanır. Başarı veya hatada da kapanır. Aynı anda tek oturum çalışır.
 
@@ -29,7 +31,7 @@ Hata olursa yanıt ve arayüz, başarısız adımı Türkçe söyler. Zaman aş�
 | --- | --- | --- |
 | 1 | Tarayıcıyı başlat | `Adım 1: Tarayıcı başlatılamadı` |
 | 2 | Kayıt sayfasını aç | `Adım 2: Kayıt sayfası açılamadı (zaman aşımı)` |
-| 3 | Doğrulama kodunu gönder | `Adım 3: Doğrulama kodu alanı bulunamadı` |
+| 3 | Doğrulama kodunu gönder. CJ ikonundan önce bölge duvarı da burada raporlanır | `Adım 3: Doğrulama kodu alanı bulunamadı` |
 | 4 | CJ ikonuna tıkla | `Adım 4: CJ giriş ikonu bulunamadı` |
 | 5 | Popup veya yönlendirmeyi algıla | `Adım 5: CJ penceresi veya yönlendirme algılanamadı` |
 | 6 | E-postayı doldur | `Adım 6: CJ e-posta alanı bulunamadı` |
@@ -44,6 +46,7 @@ Ayrıca:
 - Zaman aşımı: mesajda `(zaman aşımı)`, `"blocker":"timeout"`
 - Tarayıcı açılmazsa: `Adım 1: Tarayıcı başlatılamadı` (`"blocker":"browser"`)
 - Doğrulama sayfası hata değildir; `status:"captcha"` ile durulur.
+- Avrupa dışı erişim sayfası, CJ ikonuna (adım 4) geçilmeden: `Adım 3: qksource bölge engeli (Avrupa dışı erişim). PROXY_URL ile Avrupa proxy'si tanımlayın.` (`"step":"geo"`, `"blocker":"geo"`)
 
 Kayıt sayfasını açma (adım 2) ve CJ sayfasının yüklenmesi (adım 5) geçici bir gezinme hatasına düşerse **bir kez** yeniden dener.
 
@@ -63,6 +66,8 @@ Süresi dolmuş oturum: `404` ve `Oturum bulunamadı veya süresi doldu`.
 
 `GET /healthz` → `200` ve `ok`.
 
+`GET /debug/ip` aynı tarayıcı ve proxy ile `https://ipapi.co/json` okur. Başarı: `{"ip":"...","country":"Germany","countryCode":"DE"}`. Proxy şifresi yanıtta ve logda yoktur. Onboard sürerken `429` döner.
+
 ## Seçiciler
 Boş bırakılırsa varsayılan kullanılır. `QK_LOGIN_URL` tanımlıysa `SEL_LOGIN_URL` yok sayılır.
 
@@ -81,6 +86,10 @@ Boş bırakılırsa varsayılan kullanılır. `QK_LOGIN_URL` tanımlıysa `SEL_L
 | `SEL_CJ_AUTHORIZE` | CJ izin butonu | Authorize / Allow / Agree / Confirm / Yetki butonu |
 | `SEL_SUCCESS` | qksource dönüşünde görünen yazı | `text=/Dashboard\|My Store\|Logout\|Sign out\|Log out\|Hesabım/i` |
 | `SEL_ERROR_TEXT` | Hatalı bilgi metni | incorrect password, login failed, şifre hatalı ve benzeri |
+| `BROWSER_LOCALE` | Tarayıcı dili ve `Accept-Language` | `de-DE` (`de-DE,de;q=0.9,en;q=0.8`) |
+| `BROWSER_TZ` | IANA saat dilimi | `Europe/Berlin` |
+| `BROWSER_UA` | Kullanıcı aracısı. Boşsa masaüstü Chrome (HeadlessChrome değil) | boş |
+| `PROXY_URL` | Chromium proxy'si | yok. `http://kullanıcı:şifre@host:port` veya `socks5://...` |
 | `SESSION_TTL_MS` | Oturumun açık kalma süresi | `300000` (5 dakika) |
 
 ## Adım zaman aşımları
@@ -104,6 +113,7 @@ Her adım stdout'a tek satır JSON yazar (`step`, `stepNo`, `stepName`, `event`,
 
 ## Dikkat
 - Doğrulama kodu otomatik çözülmez. Resmi operatör okur.
+- Bölge sayfası IP'ye bakar. Dil ve saat dilimi her açılışta Avrupa'ya ayarlanır; duvar sürerse `PROXY_URL` gerekir. `GET /debug/ip` ülke kodunu gösterir.
 - CJ ikonu bulunamazsa `SEL_CJ_BUTTON` ile Playwright seçicisini verin.
 - Yetki ekranı her hesapta çıkmayabilir. Görünmezse adım 9 atlanır.
 - Oturumlar yalnızca bu sürecin belleğindedir. Süre dolunca tarayıcı kapanır; kodu yeniden başlatmak gerekir.
