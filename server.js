@@ -53,6 +53,24 @@ function log(entry) {
   if (level === "error" || level === "fatal") console.error(line);
   else if (level === "warn") console.warn(line);
   else console.log(line);
+  if (payload.sessionId) {
+    const session = sessions.get(payload.sessionId);
+    if (session) {
+      session.stepLog = session.stepLog || [];
+      session.stepLog.push({
+        ts: payload.ts,
+        step: payload.step,
+        stepNo: payload.stepNo,
+        stepName: payload.stepName,
+        event: payload.event,
+        message: payload.message ? String(payload.message).slice(0, 400) : "",
+      });
+      if (session.stepLog.length > 40) session.stepLog.shift();
+      if (payload.stepName || payload.stepNo != null) {
+        session.liveStep = { step: payload.step, stepNo: payload.stepNo, stepName: payload.stepName };
+      }
+    }
+  }
 }
 
 function warnOnce(key, entry) {
@@ -247,6 +265,55 @@ function timeoutDefault(ms) {
   return proxy ? ms * 3 : ms;
 }
 
+function stepHardTimeout() {
+  return envMs("TIMEOUT_STEP", 4 * 60 * 1000);
+}
+
+function runHardTimeout() {
+  return envMs("TIMEOUT_RUN", 4 * 60 * 1000);
+}
+
+function armRunCap(session) {
+  clearTimeout(session.runTimer);
+  const ms = runHardTimeout();
+  session.runDeadline = Date.now() + ms;
+  session.runTimer = setTimeout(() => {
+    void forceRunTimeout(session);
+  }, ms + 1500);
+}
+
+function clearRunCap(session) {
+  if (!session) return;
+  clearTimeout(session.runTimer);
+  session.runTimer = null;
+  session.runDeadline = 0;
+}
+
+function claim(session) {
+  if (!session || session.settled || session.closing) return false;
+  session.settled = true;
+  return true;
+}
+
+async function runWithinCap(session, fn, limit) {
+  const cap = limit == null ? stepHardTimeout() : limit;
+  const remain = session?.runDeadline ? session.runDeadline - Date.now() : Infinity;
+  const budget = Math.max(1, Math.min(cap, remain));
+  const kind = remain <= cap ? "run-timeout" : "step-timeout";
+  let timer;
+  const work = Promise.resolve().then(fn);
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(kind);
+      err.name = "TimeoutError";
+      err.code = kind;
+      reject(err);
+    }, budget);
+  });
+  work.then(() => clearTimeout(timer), () => clearTimeout(timer));
+  return Promise.race([work, timeout]);
+}
+
 function isTimeout(err) {
   const msg = String(err?.message || "");
   return err?.name === "TimeoutError" || err?.code === "timeout" || /timeout|timed out|zaman aş/i.test(msg);
@@ -290,6 +357,9 @@ function messageFor(step, err) {
     return `Adım ${n}: CJ penceresi veya yönlendirme algılanamadı. ${extra}`.trim();
   }
   if (err?.code === "not-left") return `Adım ${n}: CJ ikonu WhatsApp'ın solunda değil${err.position ? ` (${err.position})` : ""}`;
+  if (err?.code === "turnstile") return `Adım ${n}: Cloudflare Turnstile doğrulaması tamamlanmadı`;
+  if (err?.code === "run-timeout") return `Adım ${n}: ${step.name} süre sınırı aşıldı (zaman aşımı)`;
+  if (err?.code === "step-timeout") return `Adım ${n}: ${step.timeoutLabel} (zaman aşımı)`;
   if (isBadSelector(err)) return `Adım ${n}: seçici geçersiz (${step.selectorEnv || "seçici"})`;
   if (step.id === "browser") {
     return isTimeout(err) ? `Adım ${n}: Tarayıcı başlatılamadı (zaman aşımı)` : `Adım ${n}: Tarayıcı başlatılamadı`;
@@ -422,13 +492,21 @@ function turnstileTimeout() {
 // Turnstile kendi jetonunu yazar. Biz yalnızca bekleriz; jeton üretilmez.
 async function waitForTurnstile(page, deadline) {
   const end = deadline || (Date.now() + turnstileTimeout());
-  if (Date.now() >= end) return;
-  if (!(await anyFrame(page, turnstileWidgetInDocument))) return;
+  if (!(await anyFrame(page, turnstileWidgetInDocument))) return "absent";
   while (Date.now() < end) {
-    if (await anyFrame(page, turnstileTokenInDocument)) return;
-    if (!(await anyFrame(page, turnstileWidgetInDocument))) return;
+    if (await anyFrame(page, turnstileTokenInDocument)) return "ok";
+    if (!(await anyFrame(page, turnstileWidgetInDocument))) return "absent";
     await delay(400);
   }
+  if (await anyFrame(page, turnstileTokenInDocument)) return "ok";
+  if (await anyFrame(page, turnstileWidgetInDocument)) return "timeout";
+  return "absent";
+}
+
+function turnstileTimeoutError() {
+  const err = new Error("Cloudflare Turnstile doğrulaması tamamlanmadı");
+  err.code = "turnstile";
+  return err;
 }
 
 async function frameHasCaptcha(frame) {
@@ -1538,7 +1616,7 @@ async function runStep(ctx, step, fn) {
     message: `Adım ${step.n} başladı: ${step.name}`,
   });
   try {
-    await fn();
+    await runWithinCap(ctx, () => fn(), stepHardTimeout());
     log({
       level: "info",
       step: step.id,
@@ -1565,7 +1643,9 @@ async function runStep(ctx, step, fn) {
       throw err;
     }
     if (err?.handled) throw err;
-    if (await isCaptchaPage(ctx.active || ctx.page).catch(() => false)) {
+    if (ctx.settled) throw err;
+    const hardStop = err?.code === "turnstile" || err?.code === "run-timeout" || err?.code === "step-timeout";
+    if (!hardStop && await isCaptchaPage(ctx.active || ctx.page).catch(() => false)) {
       const pause = new Error("captcha");
       pause.captchaPause = true;
       pause.image = await captureCaptchaImage(ctx.active || ctx.page).catch(() => null);
@@ -1619,6 +1699,70 @@ async function runStep(ctx, step, fn) {
   }
 }
 
+const finishedRuns = new Map();
+
+function rememberResult(session, body) {
+  const id = session?.id;
+  if (!id) return body;
+  const prev = finishedRuns.get(id);
+  if (prev?.timer) clearTimeout(prev.timer);
+  const step = session.currentStep;
+  const stored = {
+    ...body,
+    stepNo: body?.stepNo ?? step?.n ?? session.liveStep?.stepNo ?? null,
+    stepName: body?.stepName || step?.name || session.liveStep?.stepName || null,
+    log: (session.stepLog || []).slice(),
+  };
+  const timer = setTimeout(() => finishedRuns.delete(id), 2 * 60 * 1000);
+  finishedRuns.set(id, { body: stored, timer });
+  session.result = stored;
+  return stored;
+}
+
+function hardTimeoutBody(session, shot) {
+  const step = session?.currentStep;
+  const error = step
+    ? `Adım ${step.n}: ${step.name} süre sınırı aşıldı (zaman aşımı)`
+    : "İşlem süre sınırı aşıldı (zaman aşımı)";
+  const url = currentUrl(session?.active) || currentUrl(session?.page);
+  const screenshots = shot ? [{ url, image: shot }] : [];
+  return {
+    ok: false,
+    status: "error",
+    error,
+    step: step?.id || "onboard",
+    url: url ? redact(url, 500) : null,
+    screenshot: shot || null,
+    screenshots,
+    blocker: "timeout",
+    detail: error,
+    log: (session?.stepLog || []).slice(),
+  };
+}
+
+async function forceRunTimeout(session) {
+  if (!claim(session)) return;
+  clearRunCap(session);
+  const err = Object.assign(new Error("run-timeout"), { name: "TimeoutError", code: "run-timeout" });
+  await attachFailureShot(err, session).catch(() => {});
+  const body = hardTimeoutBody(session, err.screenshot || null);
+  session.busy = false;
+  log({
+    level: "error",
+    step: body.step,
+    stepNo: session.currentStep?.n ?? null,
+    stepName: session.currentStep?.name ?? null,
+    event: "fail",
+    email: session.email,
+    sessionId: session.id,
+    url: body.url,
+    message: body.error,
+    blocker: "timeout",
+  });
+  rememberResult(session, body);
+  await closeSession(session.id);
+}
+
 function armTimeout(session) {
   clearTimeout(session.timer);
   session.timer = setTimeout(() => {
@@ -1639,6 +1783,9 @@ async function closeSession(id) {
   if (!session || session.closing) return;
   session.closing = true;
   clearTimeout(session.timer);
+  clearTimeout(session.runTimer);
+  session.runTimer = null;
+  session.busy = false;
   sessions.delete(id);
   if (activeSessionId === id) activeSessionId = null;
   session.password = "";
@@ -1648,6 +1795,7 @@ async function closeSession(id) {
 }
 
 function captchaResult(session, image) {
+  clearRunCap(session);
   armTimeout(session);
   log({
     level: "info",
@@ -1983,7 +2131,8 @@ async function leftCaptcha(page, url, startUrl) {
 }
 
 async function settleAfterCaptchaSubmit(page, beforeSrc, startUrl, hadError, turnstileDeadline) {
-  await waitForTurnstile(page, turnstileDeadline).catch(() => {});
+  const turnstile = await waitForTurnstile(page, turnstileDeadline).catch(() => "absent");
+  if (turnstile === "timeout") throw turnstileTimeoutError();
   const timeout = TIMEOUTS.captcha;
   let stop = false;
   let sawReload = false;
@@ -2055,7 +2204,8 @@ async function submitCaptchaCode(session, code) {
     const input = page.locator(CAPTCHA_INPUT).first();
     await input.waitFor({ state: "visible", timeout: TIMEOUTS.captcha });
     await input.fill(String(code), { timeout: TIMEOUTS.captcha });
-    await waitForTurnstile(page, turnstileDeadline);
+    const turnstile = await waitForTurnstile(page, turnstileDeadline);
+    if (turnstile === "timeout") throw turnstileTimeoutError();
     try {
       await page.locator(CAPTCHA_SUBMIT).first().click({ timeout: TIMEOUTS.captcha, noWaitAfter: true });
     } catch (err) {
@@ -2128,10 +2278,10 @@ async function withSessionSecrets(session, code, fn) {
   }
 }
 
-const configured = ["QK_LOGIN_URL", "SEL_LOGIN_URL", "SEL_CJ_BUTTON", "SEL_CJ_EMAIL", "SEL_CJ_PASSWORD", "SEL_CJ_SUBMIT", "SEL_CJ_AUTHORIZE", "SEL_SUCCESS", "SEL_ERROR_TEXT", "SEL_CAPTCHA", "SEL_CAPTCHA_INPUT", "SEL_CAPTCHA_SUBMIT", "SEL_CAPTCHA_IMAGE", "BROWSER_LOCALE", "BROWSER_TZ", "BROWSER_UA", "PROXY_URL", "TIMEOUT_OPEN_LOGIN", "TIMEOUT_CAPTCHA", "TIMEOUT_CJ_BUTTON", "TIMEOUT_CJ_CLICK", "TIMEOUT_CJ_NAVIGATION", "TIMEOUT_TURNSTILE", "TIMEOUT_POPUP", "TIMEOUT_NAVIGATION", "TIMEOUT_EMAIL", "TIMEOUT_PASSWORD", "TIMEOUT_SUBMIT", "TIMEOUT_AUTHORIZE", "TIMEOUT_SUCCESS", "SESSION_TTL_MS"]
+const configured = ["QK_LOGIN_URL", "SEL_LOGIN_URL", "SEL_CJ_BUTTON", "SEL_CJ_EMAIL", "SEL_CJ_PASSWORD", "SEL_CJ_SUBMIT", "SEL_CJ_AUTHORIZE", "SEL_SUCCESS", "SEL_ERROR_TEXT", "SEL_CAPTCHA", "SEL_CAPTCHA_INPUT", "SEL_CAPTCHA_SUBMIT", "SEL_CAPTCHA_IMAGE", "BROWSER_LOCALE", "BROWSER_TZ", "BROWSER_UA", "PROXY_URL", "TIMEOUT_OPEN_LOGIN", "TIMEOUT_CAPTCHA", "TIMEOUT_CJ_BUTTON", "TIMEOUT_CJ_CLICK", "TIMEOUT_CJ_NAVIGATION", "TIMEOUT_TURNSTILE", "TIMEOUT_STEP", "TIMEOUT_RUN", "TIMEOUT_POPUP", "TIMEOUT_NAVIGATION", "TIMEOUT_EMAIL", "TIMEOUT_PASSWORD", "TIMEOUT_SUBMIT", "TIMEOUT_AUTHORIZE", "TIMEOUT_SUCCESS", "SESSION_TTL_MS"]
   .filter((name) => typeof process.env[name] === "string" && process.env[name].trim() !== "");
 log({ level: "info", step: "config", event: "env", message: configured.length ? `Ayarlı ortam değişkenleri: ${configured.join(", ")}` : "Seçici ve zaman aşımı varsayılanları kullanılıyor" });
-log({ level: "info", step: "config", event: "timeouts", message: `Zaman aşımları ms: açık=${TIMEOUTS.openLogin}, captcha=${TIMEOUTS.captcha}, cj=${TIMEOUTS.cjButton}, cjTik=${envMs("TIMEOUT_CJ_CLICK", 20000)}, cjNav=${cjNavTimeout()}, turnstile=${turnstileTimeout()}, proxy=${PROXY_URL ? "var" : "yok"}` });
+log({ level: "info", step: "config", event: "timeouts", message: `Zaman aşımları ms: açık=${TIMEOUTS.openLogin}, captcha=${TIMEOUTS.captcha}, cj=${TIMEOUTS.cjButton}, cjTik=${envMs("TIMEOUT_CJ_CLICK", 20000)}, cjNav=${cjNavTimeout()}, turnstile=${turnstileTimeout()}, adım=${stepHardTimeout()}, oturum=${runHardTimeout()}, proxy=${PROXY_URL ? "var" : "yok"}` });
 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
@@ -2205,21 +2355,54 @@ app.post("/onboard", async (req, res) => {
     pendingPopup: null,
     phaseIndex: 0,
     timer: null,
+    runTimer: null,
+    runDeadline: 0,
     closing: false,
+    busy: false,
+    settled: false,
+    stepLog: [],
+    liveStep: null,
+    result: null,
   };
   sessions.set(session.id, session);
   activeSessionId = session.id;
   armTimeout(session);
+  armRunCap(session);
   log({ level: "info", step: "onboard", event: "start", email: session.email, sessionId: session.id, message: "Onboard başladı" });
   try {
-    const result = await withSessionSecrets(session, null, async () => {
+    const result = await runWithinCap(session, () => withSessionSecrets(session, null, async () => {
       await openRegister(session);
       return drive(session);
-    });
-    if (result.status !== "captcha") await closeSession(session.id);
-    res.json(result);
+    }), runHardTimeout());
+    if (session.settled) {
+      const saved = finishedRuns.get(session.id);
+      if (!res.headersSent) res.status(200).json(saved?.body || { ok: false, status: "error", error: "İşlem süre sınırı aşıldı (zaman aşımı)" });
+      return;
+    }
+    clearRunCap(session);
+    if (result.status !== "captcha") {
+      rememberResult(session, { ...result, log: (session.stepLog || []).slice() });
+      await closeSession(session.id);
+      res.json(result);
+      return;
+    }
+    session.result = { ...result, log: (session.stepLog || []).slice() };
+    res.json(session.result);
   } catch (err) {
-    const error = err instanceof Error ? err : new Error(String(err ?? "bilinmeyen hata"));
+    if (session.settled) {
+      const saved = finishedRuns.get(session.id);
+      if (!res.headersSent) res.status(200).json(saved?.body || { ok: false, status: "error", error: "İşlem süre sınırı aşıldı (zaman aşımı)" });
+      return;
+    }
+    claim(session);
+    clearRunCap(session);
+    let error = err instanceof Error ? err : new Error(String(err ?? "bilinmeyen hata"));
+    if ((error.code === "run-timeout" || error.code === "step-timeout") && session.currentStep && !error.handled) {
+      error.handled = true;
+      error.message = messageFor(session.currentStep, error);
+      error.stepId = session.currentStep.id;
+      error.stepNo = session.currentStep.n;
+    }
     await attachFailureShot(error, session);
     const body = failureBody(error, session);
     log({
@@ -2231,9 +2414,100 @@ app.post("/onboard", async (req, res) => {
       message: body.error,
       detail: body.detail || error.message,
     });
+    rememberResult(session, body);
     await closeSession(session.id);
-    res.status(error.handled ? 200 : 500).json(body);
+    if (!res.headersSent) res.status(error.handled ? 200 : 500).json(body);
   }
+});
+
+function statusView(session, body) {
+  const step = session?.currentStep;
+  const live = session?.liveStep || {};
+  const base = body || {
+    ok: true,
+    status: "running",
+    sessionId: session?.id || null,
+    screenshot: null,
+  };
+  return {
+    ...base,
+    sessionId: base.sessionId || session?.id || null,
+    step: base.step || step?.id || live.step || null,
+    stepNo: base.stepNo ?? step?.n ?? live.stepNo ?? null,
+    stepName: base.stepName || step?.name || live.stepName || null,
+    log: base.log || (session?.stepLog || []).slice(),
+    url: base.url ?? (currentUrl(session?.active) || currentUrl(session?.page) || null),
+    screenshot: base.screenshot ?? null,
+  };
+}
+
+async function runCaptchaJob(session, code) {
+  try {
+    const result = await runWithinCap(session, () => withSessionSecrets(session, code, () => submitCaptchaCode(session, code)), runHardTimeout());
+    if (!claim(session)) return;
+    clearRunCap(session);
+    if (result.status === "captcha") {
+      session.settled = false;
+      session.result = { ...result, log: (session.stepLog || []).slice() };
+      session.busy = false;
+      armTimeout(session);
+      return;
+    }
+    const shot = result.screenshot || await takeScreenshot(session.page) || await takeScreenshot(session.active);
+    const url = result.url || currentUrl(session.active) || currentUrl(session.page);
+    rememberResult(session, {
+      ...result,
+      url: url ? redact(url, 500) : null,
+      screenshot: shot,
+      screenshots: result.screenshots || (shot ? [{ url: url ? redact(url, 500) : null, image: shot }] : []),
+      log: (session.stepLog || []).slice(),
+    });
+    session.busy = false;
+    await closeSession(session.id);
+  } catch (err) {
+    if (!claim(session)) return;
+    clearRunCap(session);
+    let error = err instanceof Error ? err : new Error(String(err ?? "bilinmeyen hata"));
+    if ((error.code === "run-timeout" || error.code === "step-timeout") && session.currentStep && !error.handled) {
+      error.handled = true;
+      error.message = messageFor(session.currentStep, error);
+      error.stepId = session.currentStep.id;
+      error.stepNo = session.currentStep.n;
+    }
+    await attachFailureShot(error, session);
+    const body = failureBody(error, session);
+    log({
+      level: "error",
+      step: body.step || "captcha",
+      event: "fail",
+      email: session.email,
+      sessionId: session.id,
+      message: body.error,
+      detail: body.detail || error.message,
+    });
+    rememberResult(session, body);
+    session.busy = false;
+    await closeSession(session.id);
+  } finally {
+    if (session && sessions.has(session.id)) session.busy = false;
+  }
+}
+
+app.get("/onboard/:sessionId/status", (req, res) => {
+  const { sessionId } = req.params;
+  if (!SESSION_ID_RE.test(sessionId)) {
+    return res.status(404).json({ ok: false, status: "error", error: "Oturum bulunamadı veya süresi doldu" });
+  }
+  const session = sessions.get(sessionId);
+  if (session && !session.closing) {
+    if (session.result && session.result.status && session.result.status !== "running") {
+      return res.json(statusView(session, session.result));
+    }
+    return res.json(statusView(session, null));
+  }
+  const done = finishedRuns.get(sessionId);
+  if (done) return res.json(done.body);
+  return res.status(404).json({ ok: false, status: "error", error: "Oturum bulunamadı veya süresi doldu" });
 });
 
 app.post("/onboard/:sessionId/captcha", async (req, res) => {
@@ -2252,30 +2526,42 @@ app.post("/onboard/:sessionId/captcha", async (req, res) => {
   if (session.busy) {
     return res.status(429).json({ ok: false, status: "error", error: "Başka bir işlem sürüyor, biraz sonra deneyin" });
   }
+  const trimmed = code.trim();
   session.busy = true;
-  armTimeout(session);
-  try {
-    const result = await withSessionSecrets(session, code, () => submitCaptchaCode(session, code.trim()));
-    if (result.status !== "captcha") await closeSession(session.id);
-    res.json(result);
-  } catch (err) {
-    const error = err instanceof Error ? err : new Error(String(err ?? "bilinmeyen hata"));
-    await attachFailureShot(error, session);
-    const body = failureBody(error, session);
-    log({
-      level: "error",
-      step: body.step || "captcha",
-      event: "fail",
-      email: session.email,
-      sessionId: session.id,
-      message: body.error,
-      detail: body.detail || error.message,
-    });
-    await closeSession(session.id);
-    res.status(error.handled ? 200 : 500).json(body);
-  } finally {
-    if (sessions.has(sessionId)) session.busy = false;
-  }
+  session.settled = false;
+  session.result = null;
+  clearTimeout(session.timer);
+  session.timer = null;
+  armRunCap(session);
+  res.json(statusView(session, {
+    ok: true,
+    status: "running",
+    sessionId: session.id,
+    step: STEPS.captcha.id,
+    stepNo: STEPS.captcha.n,
+    stepName: STEPS.captcha.name,
+    screenshot: null,
+  }));
+  void runCaptchaJob(session, trimmed).catch((err) => {
+    session.busy = false;
+    if (claim(session)) {
+      clearRunCap(session);
+      const body = {
+        ok: false,
+        status: "error",
+        error: "Beklenmeyen sunucu hatası",
+        step: "captcha",
+        url: null,
+        screenshot: null,
+        screenshots: [],
+        blocker: null,
+        detail: redact(err?.message || "bilinmeyen hata", 500),
+        log: (session.stepLog || []).slice(),
+      };
+      rememberResult(session, body);
+      void closeSession(session.id);
+    }
+  });
 });
 
 app.get("/", (_req, res) => res.type("html").send(`<!doctype html><html lang="tr"><head><meta charset="utf-8">
@@ -2286,7 +2572,7 @@ label{display:block;margin:14px 0 6px;font-weight:600}input{width:100%;padding:1
 button{margin-top:20px;width:100%;padding:12px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:16px;cursor:pointer}
 button.black{background:#111}button:disabled{background:#94a3b8}#r{margin-top:20px;word-break:break-all}.ok{color:#15803d}.err{color:#b91c1c}
 img{max-width:100%;margin-top:10px;border:1px solid #ddd}#cap[hidden]{display:none}#cap img{display:block;margin:12px auto;background:#fff}
-.hint{color:#64748b;font-size:14px;margin-top:8px}</style></head>
+.hint{color:#64748b;font-size:14px;margin-top:8px}ol.log{margin:8px 0 0;padding-left:18px;color:#334155;font-size:13px}ol.log li{margin:4px 0}</style></head>
 <body><div class="c"><h2>Qksource – CJ ile Hesap Aç</h2><form id="f">
 <label>CJ e-posta / kullanıcı adı</label><input name="cjEmail" required autocomplete="off">
 <label>CJ şifre</label><input name="cjPassword" type="password" required autocomplete="new-password">
@@ -2298,23 +2584,46 @@ img{max-width:100%;margin-top:10px;border:1px solid #ddd}#cap[hidden]{display:no
 <script>
 const f=document.getElementById('f'),b=document.getElementById('b'),r=document.getElementById('r');
 const cap=document.getElementById('cap'),capimg=document.getElementById('capimg'),code=document.getElementById('code'),send=document.getElementById('send');
-let sessionId=null;
+let sessionId=null,pollTimer=null,polling=false;
 const esc=s=>String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+function renderLog(log){
+  if(!log||!log.length)return '';
+  return '<ol class="log">'+log.map(function(line){
+    var label=line.stepNo?('Adım '+line.stepNo+': '+(line.stepName||'')):(line.stepName||line.step||'');
+    return '<li>'+esc(label)+' — '+esc(line.message||line.event||'')+'</li>';
+  }).join('')+'</ol>';
+}
 function show(j){
-  if(j&&j.status==='captcha'){sessionId=j.sessionId;cap.hidden=false;capimg.src='data:image/png;base64,'+String(j.image||'').replace(/[^A-Za-z0-9+/=]/g,'');code.value='';code.focus();
-    r.innerHTML='<p class="hint">Oturum açık. Kodu gönderin.</p>';return;}
-  cap.hidden=true;sessionId=null;
-  if(j&&j.ok){r.innerHTML='<p class="ok">✅ Başarılı</p><p>Son URL: '+esc(j.url)+'</p>';}
-  else{var detail=(j&&j.detail&&j.detail!==j.error)?'<p>'+esc(j.detail)+'</p>':'';var shots=(j&&j.screenshots)||[];if(!shots.length&&j&&j.screenshot)shots=[{url:j.url,image:j.screenshot}];var imgs=shots.filter(function(s){return s&&s.image;}).map(function(s){return '<p>'+esc(s.url||'sayfa')+'</p><img alt="Sayfa" src="data:image/png;base64,'+String(s.image).replace(/[^A-Za-z0-9+/=]/g,'')+'">';}).join('');r.innerHTML='<p class="err">❌ Hata: '+esc((j&&j.error)||'yanıt yok')+'</p>'+detail+(j&&j.url?'<p>URL: '+esc(j.url)+'</p>':'')+imgs;}
+  if(j&&j.status==='captcha'){sessionId=j.sessionId;cap.hidden=false;capimg.src='data:image/png;base64,'+String(j.image||'').replace(/[^A-Za-z0-9+/=]/g,'');code.value='';code.focus();send.disabled=false;b.disabled=true;b.textContent='Başlat';
+    r.innerHTML='<p class="hint">Oturum açık. Kodu gönderin.</p>'+renderLog(j.log);return;}
+  cap.hidden=true;sessionId=null;send.disabled=false;
+  var shots=(j&&j.screenshots)||[];if(!shots.length&&j&&j.screenshot)shots=[{url:j.url,image:j.screenshot}];
+  var imgs=shots.filter(function(s){return s&&s.image;}).map(function(s){return '<p>'+esc(s.url||'sayfa')+'</p><img alt="Sayfa" src="data:image/png;base64,'+String(s.image).replace(/[^A-Za-z0-9+/=]/g,'')+'">';}).join('');
+  if(j&&j.ok){r.innerHTML='<p class="ok">✅ Başarılı</p><p>Son URL: '+esc(j.url)+'</p>'+imgs+renderLog(j.log);}
+  else{var detail=(j&&j.detail&&j.detail!==j.error)?'<p>'+esc(j.detail)+'</p>':'';r.innerHTML='<p class="err">❌ Hata: '+esc((j&&j.error)||'yanıt yok')+'</p>'+detail+(j&&j.url?'<p>URL: '+esc(j.url)+'</p>':'')+imgs+renderLog(j&&j.log);}
   b.disabled=false;b.textContent='Başlat';
 }
-f.onsubmit=async e=>{e.preventDefault();b.disabled=true;b.textContent='Çalışıyor...';r.innerHTML='';cap.hidden=true;
+function stopPoll(){polling=false;if(pollTimer){clearInterval(pollTimer);pollTimer=null;}}
+async function pull(){
+  if(!polling||!sessionId)return;
+  var id=sessionId;
+  try{
+    const x=await fetch('/onboard/'+encodeURIComponent(id)+'/status');
+    const j=await x.json();
+    if(!polling||sessionId!==id)return;
+    if(j&&j.status==='running'){r.innerHTML='<p class="hint">Çalışıyor... '+(j.stepNo?('Adım '+j.stepNo+': '+(j.stepName||'')):(j.stepName||''))+'</p>'+renderLog(j.log);return;}
+    stopPoll();
+    show(j);
+  }catch(err){if(!polling)return;r.innerHTML='<p class="err">❌ '+esc(err.message)+'</p>';send.disabled=false;}
+}
+function startPoll(){stopPoll();polling=true;pull();pollTimer=setInterval(pull,2000);}
+f.onsubmit=async e=>{e.preventDefault();stopPoll();b.disabled=true;b.textContent='Çalışıyor...';r.innerHTML='';cap.hidden=true;
 try{const d=Object.fromEntries(new FormData(f));f.cjPassword.value='';const x=await fetch('/onboard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
 const j=await x.json();show(j);}catch(err){r.innerHTML='<p class="err">❌ '+esc(err.message)+'</p>';b.disabled=false;b.textContent='Başlat';}};
-send.onclick=async()=>{if(!sessionId)return;send.disabled=true;
-try{const x=await fetch('/onboard/'+encodeURIComponent(sessionId)+'/captcha',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:code.value})});
-const j=await x.json();show(j);}catch(err){r.innerHTML='<p class="err">❌ '+esc(err.message)+'</p>';}
-send.disabled=false;};
+send.onclick=async()=>{if(!sessionId||send.disabled)return;send.disabled=true;stopPoll();r.innerHTML='<p class="hint">Çalışıyor...</p>';
+var id=sessionId;
+try{const x=await fetch('/onboard/'+encodeURIComponent(id)+'/captcha',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:code.value})});
+const j=await x.json();if(j&&j.status==='running'){startPoll();return;}show(j);}catch(err){r.innerHTML='<p class="err">❌ '+esc(err.message)+'</p>';send.disabled=false;}};
 </script></body></html>`));
 
 app.use((err, _req, res, next) => {

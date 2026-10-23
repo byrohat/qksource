@@ -16,7 +16,7 @@ Arayüz ve API ayrı bir uygulama şifresi istemez.
 1. `https://qksource.com/register.html` açılır. Tarayıcı Avrupa yerel ayarıyla başlar: dil `BROWSER_LOCALE` (varsayılan `de-DE`), saat dilimi `BROWSER_TZ` (varsayılan `Europe/Berlin`), buna uyan `Accept-Language`, masaüstü Chrome kullanıcı aracısı (`BROWSER_UA` ile değiştirilebilir) ve 1366×768 pencere. `PROXY_URL` doluysa Chromium bu proxy ile çıkar.
 2. Sayfa "only accessible to European sites" diyorsa CJ ikonuna geçilmez. Yanıt: `Adım 3: qksource bölge engeli (Avrupa dışı erişim). PROXY_URL ile Avrupa proxy'si tanımlayın.`
 3. "We would like to make sure you are not a robot" sayfası çıkarsa oturum durur. Yanıt `{status:"captcha", sessionId, image}` şeklindedir. `image`, doğrulama görselinin base64 PNG ekran görüntüsüdür. Ekran görüntüsü, `img` `complete` olana ve `naturalWidth > 0` olana kadar beklenir; kısa bir gecikmeden sonra alınır. Görsel boşsa resme veya yenile bağlantısına tıklanıp bir kez daha denenir. Sunucu OCR veya dış çözüm servisi kullanmaz.
-4. Operatör kodu yazar. Arayüz `POST /onboard/:sessionId/captcha` ile `{code}` gönderir. Sayfada Cloudflare Turnstile varsa sunucu, kendi `cf-turnstile-response` alanı dolana kadar en fazla `TIMEOUT_TURNSTILE` (varsayılan 30 sn) bekler; jetonu üretmez ve çözmez. Sonra kodu yazar, Submit'e basar. Başarı için doğrulama izlerinin kalkması gerekir: `#verifyCode` yok, `meta[name=validation]` yok, başlık "Human verification" değil. Kayıt formu da durmalıdır (Welcome to Qksource, Create a Qksource account, Confirm Password veya WhatsApp satırı). Adres `register.html` kalsa bile izler duruyorsa kod yanlış veya bitmemiş sayılır ve yeni `image` döner. Yol doğrulama sayfasından çıkıp yeni sayfa doğrulama değilse (örneğin CJ giriş formu) akış sürer. Geçiş sırasında oluşan "Execution context was destroyed" yüzünden akış düşmez.
+4. Operatör kodu yazar. Arayüz `POST /onboard/:sessionId/captcha` ile `{code}` gönderir. Bu istek hemen `{status:"running"}` döner; iş arka planda sürer. Arayüz 2 saniyede bir `GET /onboard/:sessionId/status` okur ve adım günlüğünü gösterir. Sayfada Cloudflare Turnstile varsa sunucu, kendi `cf-turnstile-response` alanı dolana kadar en fazla `TIMEOUT_TURNSTILE` (varsayılan 30 sn) bekler; jetonu üretmez ve çözmez. Süre dolarsa yanıt `Adım 3: Cloudflare Turnstile doğrulaması tamamlanmadı` olur ve o sayfanın ekran görüntüsü eklenir. Jeton gelirse kodu yazar, Submit'e basar. Başarı için doğrulama izlerinin kalkması gerekir: `#verifyCode` yok, `meta[name=validation]` yok, başlık "Human verification" değil. Kayıt formu da durmalıdır (Welcome to Qksource, Create a Qksource account, Confirm Password veya WhatsApp satırı). Adres `register.html` kalsa bile izler duruyorsa kod yanlış veya bitmemiş sayılır ve yeni `image` döner. Yol doğrulama sayfasından çıkıp yeni sayfa doğrulama değilse (örneğin CJ giriş formu) akış sürer. Geçiş sırasında oluşan "Execution context was destroyed" yüzünden akış düşmez.
 5. Kod yanlışsa veya sayfa yeniden doğrulama isterse aynı oturumda yeni bir `image` döner.
 6. "Welcome to Qksource.com" kayıt penceresinde turuncu CJ ikonuna tıklanır. İkon, yalnızca sosyal giriş satırında, WhatsApp ile aynı hizada ve onun solundaki simgedir (`src` / `href` / `class` / `alt` içinde `cj` varsa o tercih edilir). `#verifyCode` ve doğrulama sayfasının içindeki öğeler seçilmez. WhatsApp satırı yokken sayfadaki rastgele `cj` yazısına düşülmez. Sayfa hâlâ insan doğrulamasındaysa yeni resim döner, ikona tıklanmaz. `SEL_CJ_BUTTON` tanımlıysa o seçici kullanılır; yine de `#verifyCode` veya doğrulama yerleşimine oturursa tıklanmaz.
 7. Sosyal girişten önce, metni agree / terms / privacy / policy / sözleş / gizlilik / onay olan işaretlenmemiş bir kutu varsa işaretlenir.
@@ -60,7 +60,10 @@ Proxy yavaşsa gereksiz üçüncü taraf istekleri kesilir: Google GSI (`account
 Doğrulama: `{"status":"captcha","sessionId":"...","image":"<base64 png>"}`
 
 `POST /onboard/:sessionId/captcha`, gövde: `{"code":"..."}`  
-Aynı üç yanıttan biri: yeni captcha, başarı veya hata.
+Hemen döner: `{"ok":true,"status":"running","sessionId":"...","step":"captcha","stepNo":3,"stepName":"Doğrulama kodunu gönder","log":[...]}`  
+İş sürerken `GET /onboard/:sessionId/status` aynı oturumu verir. `status:"running"` iken `step`, `stepNo`, `stepName` ve `log` (adım günlüğü) dolar. Bitince durum `captcha`, `ok` veya `error` olur; hata ve başarıda `screenshot` da vardır. Oturum kapandıktan sonra sonuç kısa süre bu adresten okunur.
+
+Aynı üç sonuçtan biri: yeni captcha, başarı veya hata.
 
 Başarı: `{"ok":true,"status":"ok","url":"..."}`
 
@@ -97,7 +100,7 @@ Boş bırakılırsa varsayılan kullanılır. `QK_LOGIN_URL` tanımlıysa `SEL_L
 | `SESSION_TTL_MS` | Oturumun açık kalma süresi | `300000` (5 dakika) |
 
 ## Adım zaman aşımları
-Milisaniye. Geçersiz veya boşsa varsayılan kullanılır. `PROXY_URL` doluysa ve ilgili değişken boşsa varsayılan **3 katına** çıkar (proxy yavaştır). `TIMEOUT_CJ_CLICK` buna girmez; boşsa 20000 kalır. `TIMEOUT_TURNSTILE` de girmez; boşsa 30000 kalır. `TIMEOUT_CJ_NAVIGATION` boşsa proxy varken 90000, yokken 45000 olur; proxy bunu bir daha 3 katına çıkarmaz. Değişkeni elle verirseniz o değer kullanılır.
+Milisaniye. Geçersiz veya boşsa varsayılan kullanılır. `PROXY_URL` doluysa ve ilgili değişken boşsa varsayılan **3 katına** çıkar (proxy yavaştır). `TIMEOUT_CJ_CLICK`, `TIMEOUT_TURNSTILE`, `TIMEOUT_STEP` ve `TIMEOUT_RUN` buna girmez. `TIMEOUT_CJ_NAVIGATION` boşsa proxy varken 90000, yokken 45000 olur; proxy bunu bir daha 3 katına çıkarmaz. Değişkeni elle verirseniz o değer kullanılır. `TIMEOUT_STEP` ve `TIMEOUT_RUN` (varsayılan 4 dakika) aşılırsa işlem sessiz kalmaz: ilgili adımın hatası ve ekran görüntüsü yazılır, `Başka bir işlem sürüyor` kilidi kalkar.
 
 | Değişken | Adım | Varsayılan |
 | --- | --- | --- |
@@ -106,7 +109,9 @@ Milisaniye. Geçersiz veya boşsa varsayılan kullanılır. `PROXY_URL` doluysa 
 | `TIMEOUT_CJ_BUTTON` | 4, CJ ikonu | `20000` |
 | `TIMEOUT_CJ_CLICK` | 5, her tıklama denemesinden sonra popup, yönlendirme veya iframe | `20000`. Bu değişken proxy ile 3 katına çıkmaz |
 | `TIMEOUT_CJ_NAVIGATION` | 5, CJ popup'ını açma ve `chrome-error` sonrası yeniden deneme | proxy yoksa `45000`, proxy varsa `90000`. Elle verilirse o değer. Proxy ile tekrar 3 katına çıkmaz |
-| `TIMEOUT_TURNSTILE` | 3, Turnstile'ın kendi jetonunu yazması | `30000`. Bu değişken proxy ile 3 katına çıkmaz |
+| `TIMEOUT_TURNSTILE` | 3, Turnstile'ın kendi jetonunu yazması. Dolmazsa `Cloudflare Turnstile doğrulaması tamamlanmadı` | `30000`. Bu değişken proxy ile 3 katına çıkmaz |
+| `TIMEOUT_STEP` | Her adımın sert üst sınırı. Aşılırsa adım hatası ve ekran görüntüsü | `240000` (4 dk). Proxy ile 3 katına çıkmaz |
+| `TIMEOUT_RUN` | Bir çalıştırmanın sert üst sınırı (kod gönderildikten sonra veya sayfa açılırken). Aşılırsa adım hatası, ekran görüntüsü ve kilit kalkar | `240000` (4 dk). Proxy ile 3 katına çıkmaz |
 | `TIMEOUT_POPUP` | Eski adım 5 beklemesi. Yeni akış `TIMEOUT_CJ_CLICK` kullanır | `8000` |
 | `TIMEOUT_NAVIGATION` | Sayfa yüklenmesi | `30000` |
 | `TIMEOUT_EMAIL` | 6, e-posta | `30000` |
