@@ -15,8 +15,8 @@ Arayüz ve API ayrı bir uygulama şifresi istemez.
 ## Akış
 1. `https://qksource.com/register.html` açılır. Tarayıcı Avrupa yerel ayarıyla başlar: dil `BROWSER_LOCALE` (varsayılan `de-DE`), saat dilimi `BROWSER_TZ` (varsayılan `Europe/Berlin`), buna uyan `Accept-Language`, masaüstü Chrome kullanıcı aracısı (`BROWSER_UA` ile değiştirilebilir) ve 1366×768 pencere. `PROXY_URL` doluysa Chromium bu proxy ile çıkar.
 2. Sayfa "only accessible to European sites" diyorsa CJ ikonuna geçilmez. Yanıt: `Adım 3: qksource bölge engeli (Avrupa dışı erişim). PROXY_URL ile Avrupa proxy'si tanımlayın.`
-3. "We would like to make sure you are not a robot" sayfası çıkarsa oturum durur. Yanıt `{status:"captcha", sessionId, image}` şeklindedir. `image`, doğrulama görselinin base64 PNG ekran görüntüsüdür. Sunucu OCR veya dış çözüm servisi kullanmaz.
-4. Operatör kodu yazar. Arayüz `POST /onboard/:sessionId/captcha` ile `{code}` gönderir. Sunucu alanı doldurur ve Submit'e basar.
+3. "We would like to make sure you are not a robot" sayfası çıkarsa oturum durur. Yanıt `{status:"captcha", sessionId, image}` şeklindedir. `image`, doğrulama görselinin base64 PNG ekran görüntüsüdür. Ekran görüntüsü, `img` `complete` olana ve `naturalWidth > 0` olana kadar beklenir; kısa bir gecikmeden sonra alınır. Görsel boşsa resme veya yenile bağlantısına tıklanıp bir kez daha denenir. Sunucu OCR veya dış çözüm servisi kullanmaz.
+4. Operatör kodu yazar. Arayüz `POST /onboard/:sessionId/captcha` ile `{code}` gönderir. Sunucu alanı doldurur, Submit'e basar ve `register.html` yoluna gidişi ya da yeni bir doğrulama görselini bekler. Geçiş sırasında oluşan "Execution context was destroyed" yüzünden akış düşmez. Kod yanlışsa yeni `image` döner.
 5. Kod yanlışsa veya sayfa yeniden doğrulama isterse aynı oturumda yeni bir `image` döner.
 6. "Welcome to Qksource.com" kayıt penceresinde turuncu CJ ikonuna tıklanır. Varsayılan arama: `src` / `href` / `class` / `alt` içinde `cj` geçen öğe, yoksa WhatsApp ikonunun solundaki ilk sosyal ikon. `SEL_CJ_BUTTON` tanımlıysa yalnızca o seçici kullanılır.
 7. CJ penceresi veya yönlendirmesinde e-posta ve şifre yazılır, giriş gönderilir, izin ekranı varsa onaylanır, başarı qksource sayfasında beklenir.
@@ -25,7 +25,7 @@ Arayüz ve API ayrı bir uygulama şifresi istemez.
 Tarayıcı oturumu bellekte `sessionId` ile durur. Son işlemden sonra yaklaşık **5 dakika** (`SESSION_TTL_MS`, varsayılan `300000`) içinde kapanır. Başarı veya hatada da kapanır. Aynı anda tek oturum çalışır.
 
 ## Adımlar
-Hata olursa yanıt ve arayüz, başarısız adımı Türkçe söyler. Zaman aşımında mesajın sonuna `(zaman aşımı)` eklenir. Hata yanıtında `url` ve `screenshot` (base64 PNG) vardır.
+Hata olursa yanıt ve arayüz, başarısız adımı Türkçe söyler. Zaman aşımında mesajın sonuna `(zaman aşımı)` eklenir. Hata yanıtında `url`, `screenshot` (base64 PNG) ve özgün Playwright metni (`detail`) vardır. Adım sarmalayıcısının dışında kalan bir hata da genel bir metne düşmez; `Adım N: ad adı: <err.message>` olarak döner.
 
 | Adım | Ne yapar | Örnek hata |
 | --- | --- | --- |
@@ -93,7 +93,7 @@ Boş bırakılırsa varsayılan kullanılır. `QK_LOGIN_URL` tanımlıysa `SEL_L
 | `SESSION_TTL_MS` | Oturumun açık kalma süresi | `300000` (5 dakika) |
 
 ## Adım zaman aşımları
-Milisaniye. Geçersiz veya boşsa varsayılan kullanılır.
+Milisaniye. Geçersiz veya boşsa varsayılan kullanılır. `PROXY_URL` doluysa ve ilgili değişken boşsa varsayılan **3 katına** çıkar (proxy yavaştır). Değişkeni elle verirseniz o değer kullanılır.
 
 | Değişken | Adım | Varsayılan |
 | --- | --- | --- |

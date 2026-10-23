@@ -115,16 +115,16 @@ const SEL = {
 };
 
 const TIMEOUTS = {
-  openLogin: envMs("TIMEOUT_OPEN_LOGIN", 45000),
-  captcha: envMs("TIMEOUT_CAPTCHA", 20000),
-  cjButton: envMs("TIMEOUT_CJ_BUTTON", 20000),
-  popup: envMs("TIMEOUT_POPUP", 8000),
-  navigation: envMs("TIMEOUT_NAVIGATION", 30000),
-  email: envMs("TIMEOUT_EMAIL", 30000),
-  password: envMs("TIMEOUT_PASSWORD", 30000),
-  submit: envMs("TIMEOUT_SUBMIT", 30000),
-  authorize: envMs("TIMEOUT_AUTHORIZE", 10000),
-  success: envMs("TIMEOUT_SUCCESS", 45000),
+  openLogin: envMs("TIMEOUT_OPEN_LOGIN", timeoutDefault(45000)),
+  captcha: envMs("TIMEOUT_CAPTCHA", timeoutDefault(20000)),
+  cjButton: envMs("TIMEOUT_CJ_BUTTON", timeoutDefault(20000)),
+  popup: envMs("TIMEOUT_POPUP", timeoutDefault(8000)),
+  navigation: envMs("TIMEOUT_NAVIGATION", timeoutDefault(30000)),
+  email: envMs("TIMEOUT_EMAIL", timeoutDefault(30000)),
+  password: envMs("TIMEOUT_PASSWORD", timeoutDefault(30000)),
+  submit: envMs("TIMEOUT_SUBMIT", timeoutDefault(30000)),
+  authorize: envMs("TIMEOUT_AUTHORIZE", timeoutDefault(10000)),
+  success: envMs("TIMEOUT_SUCCESS", timeoutDefault(45000)),
 };
 
 const SESSION_TTL = envMs("SESSION_TTL_MS", 5 * 60 * 1000);
@@ -242,9 +242,19 @@ const PHASES = ["cjButton", "popup", "email", "password", "submit", "authorize",
 
 const CREDENTIAL_RE = /incorrect password|wrong password|invalid password|invalid credentials|incorrect email or password|account or password|username or password|login failed|password is incorrect|şifre hatalı|şifre yanlış|hatalı şifre|yanlış şifre|密码错误|账号或密码|用户名或密码/i;
 
+function timeoutDefault(ms) {
+  const proxy = typeof process.env.PROXY_URL === "string" && process.env.PROXY_URL.trim();
+  return proxy ? ms * 3 : ms;
+}
+
 function isTimeout(err) {
   const msg = String(err?.message || "");
   return err?.name === "TimeoutError" || err?.code === "timeout" || /timeout|timed out|zaman aş/i.test(msg);
+}
+
+function isContextDestroyed(err) {
+  const msg = `${err?.name || ""} ${err?.message || ""}`;
+  return /Execution context was destroyed|frame was detached|Navigation failed|Target closed|most likely because of a navigation|Execution context is not available/i.test(msg);
 }
 
 function isMissing(err) {
@@ -362,9 +372,19 @@ async function frameHasCaptcha(frame) {
   return frame.locator(CAPTCHA_INPUT).first().isVisible().catch(() => false);
 }
 
+function safeFrames(page) {
+  try {
+    if (!pageOpen(page)) return [];
+    return page.frames();
+  } catch (err) {
+    if (isContextDestroyed(err)) return [];
+    throw err;
+  }
+}
+
 async function isCaptchaPage(page) {
   if (!pageOpen(page)) return false;
-  for (const frame of page.frames()) {
+  for (const frame of safeFrames(page)) {
     if (await frameHasCaptcha(frame).catch(() => false)) return true;
   }
   return false;
@@ -385,47 +405,204 @@ async function detectCredentials(page) {
 async function takeScreenshot(page) {
   if (!pageOpen(page)) return null;
   try {
-    const buffer = await page.screenshot({ fullPage: false, timeout: 5000 });
+    const buffer = await page.screenshot({ fullPage: false, timeout: PROXY_URL ? 15000 : 8000 });
     return buffer.toString("base64");
   } catch {
     return null;
   }
 }
 
-// Kod çözülmez. Operatörün göreceği resim, doğrulama alanının üstündeki görseldir.
-async function captureCaptchaImage(page) {
-  if (!pageOpen(page)) return null;
+function describeCaptchaMedia() {
+  const visible = (el) => {
+    if (!el?.getClientRects?.().length) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
+  };
+  const input = [...document.querySelectorAll("input")].find((el) => visible(el) && /verification code|doğrulama kodu|captcha|verify/i.test(`${el.getAttribute("placeholder") || ""} ${el.getAttribute("aria-label") || ""} ${el.name || ""} ${el.id || ""}`));
+  const media = [...document.querySelectorAll("img, canvas")].filter(visible);
+  let el = null;
+  if (input && media.length) {
+    const ir = input.getBoundingClientRect();
+    const above = media
+      .map((node) => ({ node, r: node.getBoundingClientRect() }))
+      .filter(({ r }) => r.width > 16 && r.height > 10 && r.bottom <= ir.top + 12)
+      .sort((a, b) => (ir.top - a.r.bottom) - (ir.top - b.r.bottom));
+    el = above[0]?.node || null;
+  }
+  if (!el) el = media.find((node) => /captcha|verify|code/i.test(`${node.getAttribute("src") || ""} ${node.getAttribute("alt") || ""} ${node.id || ""}`)) || null;
+  return el;
+}
+
+async function captchaMediaState() {
+  const visible = (el) => {
+    if (!el?.getClientRects?.().length) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
+  };
+  const input = [...document.querySelectorAll("input")].find((el) => visible(el) && /verification code|doğrulama kodu|captcha|verify/i.test(`${el.getAttribute("placeholder") || ""} ${el.getAttribute("aria-label") || ""} ${el.name || ""} ${el.id || ""}`));
+  const media = [...document.querySelectorAll("img, canvas")].filter(visible);
+  let el = null;
+  if (input && media.length) {
+    const ir = input.getBoundingClientRect();
+    const above = media
+      .map((node) => ({ node, r: node.getBoundingClientRect() }))
+      .filter(({ r }) => r.width > 16 && r.height > 10 && r.bottom <= ir.top + 12)
+      .sort((a, b) => (ir.top - a.r.bottom) - (ir.top - b.r.bottom));
+    el = above[0]?.node || null;
+  }
+  if (!el) el = media.find((node) => /captcha|verify|code/i.test(`${node.getAttribute("src") || ""} ${node.getAttribute("alt") || ""} ${node.id || ""}`)) || null;
+  if (!el) return { found: false, ready: false, blank: true, failed: false, src: "" };
+  const src = el.currentSrc || el.getAttribute("src") || "";
+  const blankOf = (node) => {
+    try {
+      const w = node.tagName === "IMG" ? node.naturalWidth : node.width;
+      const h = node.tagName === "IMG" ? node.naturalHeight : node.height;
+      if (w < 2 || h < 2) return true;
+      const canvas = document.createElement("canvas");
+      const dw = Math.min(w, 64);
+      const dh = Math.min(h, 32);
+      canvas.width = dw;
+      canvas.height = dh;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(node, 0, 0, dw, dh);
+      const data = ctx.getImageData(0, 0, dw, dh).data;
+      let colored = 0;
+      const total = data.length / 4;
+      for (let i = 0; i < data.length; i += 4) {
+        if (data[i + 3] < 16) continue;
+        if (data[i] < 245 || data[i + 1] < 245 || data[i + 2] < 245) colored += 1;
+      }
+      return colored / total < 0.02;
+    } catch {
+      return false;
+    }
+  };
+  if (el.tagName === "IMG") {
+    if (!el.complete) return { found: true, ready: false, blank: true, failed: false, src };
+    if (el.naturalWidth <= 0) return { found: true, ready: false, blank: true, failed: true, src };
+    if (el.decode) {
+      try { await el.decode(); } catch { return { found: true, ready: false, blank: true, failed: false, src }; }
+    }
+    return { found: true, ready: true, blank: blankOf(el), failed: false, src };
+  }
+  const ready = el.width > 0 && el.height > 0;
+  return { found: true, ready, blank: ready ? blankOf(el) : true, failed: !ready, src };
+}
+
+function clickCaptchaRefresh() {
+  const visible = (el) => {
+    if (!el?.getClientRects?.().length) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
+  };
+  const input = [...document.querySelectorAll("input")].find((el) => visible(el) && /verification code|doğrulama kodu|captcha|verify/i.test(`${el.getAttribute("placeholder") || ""} ${el.getAttribute("aria-label") || ""} ${el.name || ""} ${el.id || ""}`));
+  const media = [...document.querySelectorAll("img, canvas")].filter(visible);
+  let img = null;
+  if (input && media.length) {
+    const ir = input.getBoundingClientRect();
+    const above = media
+      .map((node) => ({ node, r: node.getBoundingClientRect() }))
+      .filter(({ r }) => r.width > 16 && r.height > 10 && r.bottom <= ir.top + 12)
+      .sort((a, b) => (ir.top - a.r.bottom) - (ir.top - b.r.bottom));
+    img = above[0]?.node || null;
+  }
+  if (!img) img = media.find((node) => /captcha|verify|code/i.test(`${node.getAttribute("src") || ""} ${node.getAttribute("alt") || ""} ${node.id || ""}`)) || null;
+  const refresh = [...document.querySelectorAll("a, button, [role='button'], span, i")].find((el) => {
+    if (!visible(el) || el === img) return false;
+    const label = `${el.className} ${el.id} ${el.getAttribute("title") || ""} ${el.getAttribute("aria-label") || ""} ${(el.innerText || "").slice(0, 40)}`;
+    return /refresh|reload|yenile|换一张|captcha-refresh/i.test(label);
+  });
+  if (refresh) {
+    refresh.click();
+    return "link";
+  }
+  if (img) {
+    img.click();
+    return "img";
+  }
+  return "";
+}
+
+async function queryCaptchaState(page) {
+  if (!pageOpen(page)) return { found: false, ready: false, blank: true, failed: false, src: "", closed: true };
   if (CAPTCHA_IMAGE) {
     try {
       const loc = page.locator(CAPTCHA_IMAGE).first();
       if (await loc.isVisible().catch(() => false)) {
-        return (await loc.screenshot({ timeout: 5000 })).toString("base64");
+        const state = await loc.evaluate(async (el) => {
+          const src = el.currentSrc || el.getAttribute("src") || "";
+          if (el.tagName === "IMG") {
+            if (!el.complete) return { found: true, ready: false, blank: true, failed: false, src };
+            if (el.naturalWidth <= 0) return { found: true, ready: false, blank: true, failed: true, src };
+            if (el.decode) {
+              try { await el.decode(); } catch { return { found: true, ready: false, blank: true, failed: false, src }; }
+            }
+          }
+          return { found: true, ready: true, blank: false, failed: false, src };
+        });
+        if (state?.found) return state;
       }
-    } catch {
-      // Aşağıdaki yerleşim yedeğine düş.
+    } catch (err) {
+      if (isContextDestroyed(err)) return { found: false, ready: false, blank: true, failed: false, src: "", destroyed: true };
     }
   }
-  for (const frame of page.frames()) {
+  for (const frame of safeFrames(page)) {
+    const state = await frame.evaluate(captchaMediaState).catch((err) => {
+      if (isContextDestroyed(err)) return { destroyed: true };
+      return null;
+    });
+    if (state?.destroyed) return { found: false, ready: false, blank: true, failed: false, src: "", destroyed: true };
+    if (state?.found) return state;
+  }
+  return { found: false, ready: false, blank: true, failed: false, src: "" };
+}
+
+async function waitForCaptchaPixels(page, timeout) {
+  const deadline = Date.now() + timeout;
+  let last = { found: false, ready: false, blank: true, failed: false, src: "" };
+  while (Date.now() < deadline) {
+    last = await queryCaptchaState(page);
+    if (last.destroyed) {
+      await delay(300);
+      continue;
+    }
+    if (last.ready && !last.blank) {
+      await delay(400);
+      const again = await queryCaptchaState(page);
+      if (again.ready && !again.blank) return again;
+      last = again;
+    }
+    if (last.failed || (last.found && last.ready && last.blank)) return last;
+    await delay(250);
+  }
+  return last;
+}
+
+async function refreshCaptcha(page) {
+  if (CAPTCHA_IMAGE) {
+    const clicked = await page.locator(CAPTCHA_IMAGE).first().click({ timeout: 5000 }).then(() => true).catch(() => false);
+    if (clicked) return;
+  }
+  for (const frame of safeFrames(page)) {
+    const hit = await frame.evaluate(clickCaptchaRefresh).catch(() => "");
+    if (hit) return;
+  }
+}
+
+async function screenshotCaptcha(page) {
+  const shotTimeout = PROXY_URL ? 15000 : 8000;
+  if (CAPTCHA_IMAGE) {
+    try {
+      const loc = page.locator(CAPTCHA_IMAGE).first();
+      if (await loc.isVisible().catch(() => false)) return (await loc.screenshot({ timeout: shotTimeout })).toString("base64");
+    } catch (err) {
+      if (!isContextDestroyed(err)) { /* yerleşim yedeği */ }
+    }
+  }
+  for (const frame of safeFrames(page)) {
     let handle;
     try {
-      handle = await frame.evaluateHandle(() => {
-        const visible = (el) => {
-          if (!el?.getClientRects?.().length) return false;
-          const s = getComputedStyle(el);
-          return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
-        };
-        const input = [...document.querySelectorAll("input")].find((el) => visible(el) && /verification code|doğrulama kodu|captcha|verify/i.test(`${el.getAttribute("placeholder") || ""} ${el.getAttribute("aria-label") || ""} ${el.name || ""} ${el.id || ""}`));
-        const media = [...document.querySelectorAll("img, canvas")].filter(visible);
-        if (input && media.length) {
-          const ir = input.getBoundingClientRect();
-          const above = media
-            .map((el) => ({ el, r: el.getBoundingClientRect() }))
-            .filter(({ r }) => r.width > 16 && r.height > 10 && r.bottom <= ir.top + 12)
-            .sort((a, b) => (ir.top - a.r.bottom) - (ir.top - b.r.bottom));
-          if (above[0]) return above[0].el;
-        }
-        return media.find((el) => /captcha|verify|code/i.test(`${el.getAttribute("src") || ""} ${el.getAttribute("alt") || ""} ${el.id || ""}`)) || null;
-      });
+      handle = await frame.evaluateHandle(describeCaptchaMedia);
     } catch {
       continue;
     }
@@ -435,12 +612,24 @@ async function captureCaptchaImage(page) {
       continue;
     }
     try {
-      return (await el.screenshot({ timeout: 5000 })).toString("base64");
+      return (await el.screenshot({ timeout: shotTimeout })).toString("base64");
     } catch {
       await el.dispose().catch(() => {});
     }
   }
-  return takeScreenshot(page);
+  return null;
+}
+
+// Kod çözülmez. Görsel tam yüklenmeden ekran görüntüsü alınmaz.
+async function captureCaptchaImage(page) {
+  if (!pageOpen(page)) return null;
+  let state = await waitForCaptchaPixels(page, TIMEOUTS.captcha).catch(() => null);
+  if (!state?.ready || state.blank || state.failed) {
+    await refreshCaptcha(page).catch(() => {});
+    await delay(300);
+    state = await waitForCaptchaPixels(page, TIMEOUTS.captcha).catch(() => state);
+  }
+  return (await screenshotCaptcha(page).catch(() => null)) || (await takeScreenshot(page));
 }
 
 async function withNavRetry(ctx, step, fn, { recover, timeoutMs } = {}) {
@@ -461,7 +650,7 @@ async function withNavRetry(ctx, step, fn, { recover, timeoutMs } = {}) {
       message: `Adım ${step.n}: geçici gezinme hatası, bir kez yeniden deneniyor`,
       detail: err?.message,
     });
-    if (recover) await withDeadline(recover, 3000).catch(() => {});
+    if (recover) await withDeadline(recover, PROXY_URL ? 10000 : 3000).catch(() => {});
     return await run();
   }
 }
@@ -599,7 +788,15 @@ async function findCj(page) {
   return null;
 }
 
+function publicDetail(err) {
+  const raw = String(err?.message || "");
+  if (!raw || raw.length < 12) return null;
+  if (/^(geo|bad-proxy|bad-url|no-redirect|missing-button|credentials|expired|captcha)$/i.test(raw)) return null;
+  return redact(raw, 500);
+}
+
 async function runStep(ctx, step, fn) {
+  ctx.currentStep = step;
   log({
     level: "info",
     step: step.id,
@@ -684,6 +881,7 @@ async function runStep(ctx, step, fn) {
     wrapped.url = url ? redact(url, 500) : null;
     wrapped.screenshot = screenshot;
     wrapped.blocker = kind;
+    wrapped.detail = publicDetail(err);
     throw wrapped;
   }
 }
@@ -740,14 +938,27 @@ async function drive(session) {
       await runStep(session, STEPS.geo, async () => {
         if (await isGeoBlocked(session.page)) throw Object.assign(new Error("geo"), { code: "geo", blockerKind: "geo" });
       });
+      session.currentStep = STEPS.captcha;
     }
-    if (await isCaptchaPage(page)) {
+    let captchaNow = false;
+    try {
+      captchaNow = await isCaptchaPage(page);
+    } catch (err) {
+      if (!isContextDestroyed(err)) throw err;
+      await page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }).catch(() => {});
+      continue;
+    }
+    if (captchaNow) {
       return captchaResult(session, await captureCaptchaImage(page));
     }
     try {
       await runStep(session, STEPS[key], () => STEP_FNS[key](session));
     } catch (err) {
-      if (err?.captchaPause) return captchaResult(session, err.image || null);
+      if (err?.captchaPause) return captchaResult(session, err.image || await captureCaptchaImage(page).catch(() => null));
+      if (isContextDestroyed(err) && !err.handled) {
+        await page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }).catch(() => {});
+        continue;
+      }
       throw err;
     }
     session.phaseIndex += 1;
@@ -941,31 +1152,143 @@ async function openRegister(session) {
   });
 }
 
+function isRegisterPath(url) {
+  try {
+    return /\/register\.html\/?$/i.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
+
+function isValidationPath(url) {
+  try {
+    return /\/validation\.html\/?$/i.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function captchaErrorVisible(page) {
+  if (!pageOpen(page)) return false;
+  for (const frame of safeFrames(page)) {
+    const hit = await frame.locator("text=/incorrect code|invalid code|wrong code|verification failed|code is incorrect|验证码错误|doğrulama kodu hatalı|yanlış kod/i").first().isVisible().catch(() => false);
+    if (hit) return true;
+  }
+  return false;
+}
+
+function pathOf(url) {
+  try {
+    return new URL(url).pathname || "";
+  } catch {
+    return "";
+  }
+}
+
+async function leftCaptcha(page, url, startUrl) {
+  if (isRegisterPath(url)) return true;
+  if (!url || pathOf(url) === pathOf(startUrl) || isValidationPath(url)) return false;
+  return !(await isCaptchaPage(page).catch(() => true));
+}
+
+async function settleAfterCaptchaSubmit(page, beforeSrc, startUrl, hadError) {
+  const timeout = TIMEOUTS.captcha;
+  let stop = false;
+  let sawReload = false;
+  const registerWait = page.waitForURL(
+    (url) => /\/register\.html\/?$/i.test(url.pathname),
+    { timeout, waitUntil: "domcontentloaded" },
+  ).then(() => "register").catch((err) => (isContextDestroyed(err) ? "destroyed" : "register-timeout"));
+  const changeWait = (async () => {
+    const deadline = Date.now() + timeout;
+    while (!stop && Date.now() < deadline) {
+      let url = "";
+      try {
+        url = page.url();
+      } catch (err) {
+        if (!isContextDestroyed(err)) throw err;
+        await page.waitForLoadState("domcontentloaded", { timeout: Math.min(8000, Math.max(500, deadline - Date.now())) }).catch(() => {});
+        await delay(300);
+        continue;
+      }
+      if (await leftCaptcha(page, url, startUrl)) return "register";
+      if (!hadError && await captchaErrorVisible(page).catch((err) => {
+        if (isContextDestroyed(err)) return false;
+        throw err;
+      })) return "captcha";
+      const marker = await queryCaptchaState(page).catch((err) => (isContextDestroyed(err) ? { destroyed: true } : null));
+      if (marker?.destroyed) {
+        await delay(300);
+        continue;
+      }
+      const samePage = pathOf(url) === pathOf(startUrl);
+      if (samePage && beforeSrc && marker?.src && marker.src !== beforeSrc && (marker.ready || marker.failed)) return "captcha";
+      if (samePage && marker?.found && !marker.ready && !marker.failed) sawReload = true;
+      if (samePage && sawReload && marker?.ready) return "captcha";
+      await delay(300);
+    }
+    return "timeout";
+  })();
+  let winner;
+  try {
+    winner = await Promise.race([registerWait, changeWait]);
+  } finally {
+    stop = true;
+  }
+  if (winner === "register") {
+    await page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }).catch((err) => {
+      if (!isContextDestroyed(err) && !isTimeout(err)) throw err;
+    });
+    return "register";
+  }
+  if (winner === "captcha") return "captcha";
+  await page.waitForLoadState("domcontentloaded", { timeout: Math.min(TIMEOUTS.navigation, 15000) }).catch(() => {});
+  const url = currentUrl(page) || "";
+  if (await leftCaptcha(page, url, startUrl)) return "register";
+  if (isValidationPath(url) || pathOf(url) === pathOf(startUrl) || await isCaptchaPage(page).catch(() => false)) return "captcha";
+  throw Object.assign(new Error(`Timeout exceeded while waiting after captcha submit (${url || "url yok"})`), { name: "TimeoutError" });
+}
+
 async function submitCaptchaCode(session, code) {
   const page = pageOpen(session.active) ? session.active : session.page;
   session.active = page;
-  if (!(await isCaptchaPage(page))) return drive(session);
+  session.currentStep = STEPS.captcha;
+  if (!(await isCaptchaPage(page).catch(() => false))) return drive(session);
+  let outcome = "register";
   await runStep(session, STEPS.captcha, async () => {
+    const before = await queryCaptchaState(page).catch(() => ({ src: "" }));
+    const hadError = await captchaErrorVisible(page).catch(() => false);
+    const startUrl = currentUrl(page) || page.url();
     const input = page.locator(CAPTCHA_INPUT).first();
     await input.waitFor({ state: "visible", timeout: TIMEOUTS.captcha });
     await input.fill(String(code), { timeout: TIMEOUTS.captcha });
     try {
-      await page.locator(CAPTCHA_SUBMIT).first().click({ timeout: TIMEOUTS.captcha });
+      await page.locator(CAPTCHA_SUBMIT).first().click({ timeout: TIMEOUTS.captcha, noWaitAfter: true });
     } catch (err) {
-      if (!pageOpen(page)) return;
-      throw err;
+      if (!isContextDestroyed(err)) throw err;
     }
-    if (pageOpen(page)) {
-      await page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.captcha }).catch(() => {});
-      await delay(700);
-    }
+    outcome = await settleAfterCaptchaSubmit(page, before?.src || "", startUrl, hadError);
   });
+  if (outcome === "captcha") return captchaResult(session, await captureCaptchaImage(page));
   return drive(session);
 }
 
+async function attachFailureShot(err, session) {
+  if (!err || typeof err !== "object" || err.screenshot) return err;
+  const shot = await withDeadline(
+    async () => (await takeScreenshot(session?.active)) || (await takeScreenshot(session?.page)),
+    PROXY_URL ? 20000 : 8000,
+  ).catch(() => null);
+  if (shot) err.screenshot = shot;
+  return err;
+}
+
 function failureBody(err, session) {
+  const liveUrl = currentUrl(session?.active) || currentUrl(session?.page);
+  const safeUrl = (err?.url ?? liveUrl) ? redact(err?.url ?? liveUrl, 500) : null;
+  const shot = err?.screenshot ?? null;
   if (err?.code === "expired" || session?.closing) {
-    return { ok: false, status: "error", error: "Oturum bulunamadı veya süresi doldu", step: "session", url: null, screenshot: null, blocker: null };
+    return { ok: false, status: "error", error: "Oturum bulunamadı veya süresi doldu", step: "session", url: null, screenshot: shot, blocker: null, detail: null };
   }
   if (err?.handled) {
     return {
@@ -973,19 +1296,24 @@ function failureBody(err, session) {
       status: "error",
       error: redact(err.message, 500),
       step: err.stepId,
-      url: err.url ?? null,
-      screenshot: err.screenshot ?? null,
+      url: safeUrl,
+      screenshot: shot,
       blocker: err.blocker ?? null,
+      detail: err.detail || null,
     };
   }
+  const step = session?.currentStep;
+  const detail = redact(err?.message || "bilinmeyen hata", 500);
+  const error = step ? `Adım ${step.n}: ${step.name}: ${detail}` : `Otomasyon: ${detail}`;
   return {
     ok: false,
     status: "error",
-    error: "Beklenmeyen otomasyon hatası",
-    step: "onboard",
-    url: currentUrl(session?.active) || currentUrl(session?.page),
-    screenshot: null,
+    error,
+    step: step?.id || "onboard",
+    url: safeUrl,
+    screenshot: shot,
     blocker: null,
+    detail,
   };
 }
 
@@ -1004,6 +1332,7 @@ async function withSessionSecrets(session, code, fn) {
 const configured = ["QK_LOGIN_URL", "SEL_LOGIN_URL", "SEL_CJ_BUTTON", "SEL_CJ_EMAIL", "SEL_CJ_PASSWORD", "SEL_CJ_SUBMIT", "SEL_CJ_AUTHORIZE", "SEL_SUCCESS", "SEL_ERROR_TEXT", "SEL_CAPTCHA", "SEL_CAPTCHA_INPUT", "SEL_CAPTCHA_SUBMIT", "SEL_CAPTCHA_IMAGE", "BROWSER_LOCALE", "BROWSER_TZ", "BROWSER_UA", "PROXY_URL", "TIMEOUT_OPEN_LOGIN", "TIMEOUT_CAPTCHA", "TIMEOUT_CJ_BUTTON", "TIMEOUT_POPUP", "TIMEOUT_NAVIGATION", "TIMEOUT_EMAIL", "TIMEOUT_PASSWORD", "TIMEOUT_SUBMIT", "TIMEOUT_AUTHORIZE", "TIMEOUT_SUCCESS", "SESSION_TTL_MS"]
   .filter((name) => typeof process.env[name] === "string" && process.env[name].trim() !== "");
 log({ level: "info", step: "config", event: "env", message: configured.length ? `Ayarlı ortam değişkenleri: ${configured.join(", ")}` : "Seçici ve zaman aşımı varsayılanları kullanılıyor" });
+log({ level: "info", step: "config", event: "timeouts", message: `Zaman aşımları ms: açık=${TIMEOUTS.openLogin}, captcha=${TIMEOUTS.captcha}, cj=${TIMEOUTS.cjButton}, proxy=${PROXY_URL ? "var" : "yok"}` });
 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
@@ -1025,7 +1354,7 @@ app.get("/debug/ip", async (_req, res) => {
       const launched = await launchChromium();
       browser = launched.browser;
       const response = await launched.context.request.get("https://ipapi.co/json", {
-        timeout: 20000,
+        timeout: TIMEOUTS.navigation,
         headers: { "Accept-Language": acceptLanguage(BROWSER_LOCALE) },
       });
       const data = await response.json().catch(() => null);
@@ -1091,18 +1420,20 @@ app.post("/onboard", async (req, res) => {
     if (result.status !== "captcha") await closeSession(session.id);
     res.json(result);
   } catch (err) {
+    const error = err instanceof Error ? err : new Error(String(err ?? "bilinmeyen hata"));
+    await attachFailureShot(error, session);
+    const body = failureBody(error, session);
     log({
       level: "error",
-      step: "onboard",
+      step: body.step || "onboard",
       event: "fail",
       email: session.email,
       sessionId: session.id,
-      message: err?.handled ? err.message : "Beklenmeyen otomasyon hatası",
-      detail: err?.handled ? null : err?.message,
+      message: body.error,
+      detail: body.detail || error.message,
     });
-    const body = failureBody(err, session);
     await closeSession(session.id);
-    res.status(err?.handled ? 200 : 500).json(body);
+    res.status(error.handled ? 200 : 500).json(body);
   }
 });
 
@@ -1129,18 +1460,20 @@ app.post("/onboard/:sessionId/captcha", async (req, res) => {
     if (result.status !== "captcha") await closeSession(session.id);
     res.json(result);
   } catch (err) {
+    const error = err instanceof Error ? err : new Error(String(err ?? "bilinmeyen hata"));
+    await attachFailureShot(error, session);
+    const body = failureBody(error, session);
     log({
       level: "error",
-      step: "captcha",
+      step: body.step || "captcha",
       event: "fail",
       email: session.email,
       sessionId: session.id,
-      message: err?.handled ? err.message : "Beklenmeyen otomasyon hatası",
-      detail: err?.handled ? null : err?.message,
+      message: body.error,
+      detail: body.detail || error.message,
     });
-    const body = failureBody(err, session);
     await closeSession(session.id);
-    res.status(err?.handled ? 200 : 500).json(body);
+    res.status(error.handled ? 200 : 500).json(body);
   } finally {
     if (sessions.has(sessionId)) session.busy = false;
   }
@@ -1173,7 +1506,7 @@ function show(j){
     r.innerHTML='<p class="hint">Oturum açık. Kodu gönderin.</p>';return;}
   cap.hidden=true;sessionId=null;
   if(j&&j.ok){r.innerHTML='<p class="ok">✅ Başarılı</p><p>Son URL: '+esc(j.url)+'</p>';}
-  else{r.innerHTML='<p class="err">❌ Hata: '+esc((j&&j.error)||'yanıt yok')+'</p>'+(j&&j.url?'<p>URL: '+esc(j.url)+'</p>':'')+(j&&j.screenshot?'<img alt="Hata ekran görüntüsü" src="data:image/png;base64,'+String(j.screenshot).replace(/[^A-Za-z0-9+/=]/g,'')+'">':'');}
+  else{var detail=(j&&j.detail&&j.detail!==j.error)?'<p>'+esc(j.detail)+'</p>':'';r.innerHTML='<p class="err">❌ Hata: '+esc((j&&j.error)||'yanıt yok')+'</p>'+detail+(j&&j.url?'<p>URL: '+esc(j.url)+'</p>':'')+(j&&j.screenshot?'<img alt="Hata ekran görüntüsü" src="data:image/png;base64,'+String(j.screenshot).replace(/[^A-Za-z0-9+/=]/g,'')+'">':'');}
   b.disabled=false;b.textContent='Başlat';
 }
 f.onsubmit=async e=>{e.preventDefault();b.disabled=true;b.textContent='Çalışıyor...';r.innerHTML='';cap.hidden=true;
