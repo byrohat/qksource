@@ -1,14 +1,19 @@
 import express from "express";
+import { randomUUID } from "node:crypto";
 import { chromium } from "playwright";
 
-// CJ şifresi yalnızca istek süresince burada durur; log ve yanıtlardan silinir.
-let activeSecret = "";
+// CJ şifresi ve doğrulama kodu yalnızca işlem sırasında burada durur; loglara yazılmaz.
+let activeSecrets = [];
 
 const warned = new Set();
+const sessions = new Map();
+let activeSessionId = null;
 
 function redact(text, limit = 0) {
   let s = String(text ?? "");
-  if (activeSecret) s = s.split(String(activeSecret)).join("[REDACTED]");
+  for (const secret of activeSecrets) {
+    if (secret) s = s.split(String(secret)).join("[REDACTED]");
+  }
   s = s.replace(/\s+/g, " ").trim();
   if (limit > 0 && s.length > limit) s = s.slice(0, limit);
   return s;
@@ -24,6 +29,7 @@ function log(entry) {
     stepName: entry.stepName ?? null,
     event: entry.event ?? null,
     email: entry.email ?? null,
+    sessionId: entry.sessionId ?? null,
     url: entry.url == null ? null : redact(entry.url, 500),
     message: entry.message == null ? null : redact(entry.message, 500),
     detail: entry.detail == null ? null : redact(entry.detail, 500),
@@ -76,30 +82,27 @@ function envMs(name, fallback) {
   return n;
 }
 
+const CJ_BUTTON_OVERRIDE = envStr("SEL_CJ_BUTTON", "");
+const CAPTCHA_INPUT = envStr("SEL_CAPTCHA_INPUT", "input[placeholder*='verification code' i], input[placeholder*='doğrulama kodu' i], input[aria-label*='verification code' i], input[name='code' i], input[name*='verify' i], input[id*='captcha' i]");
+const CAPTCHA_SUBMIT = envStr("SEL_CAPTCHA_SUBMIT", "button:has-text('Submit'), button:has-text('Gönder'), input[type='submit']");
+const CAPTCHA_IMAGE = envStr("SEL_CAPTCHA_IMAGE", "");
+const CAPTCHA_WIDGETS = envStr("SEL_CAPTCHA", "")
+  ? [envStr("SEL_CAPTCHA", "")]
+  : ["iframe[src*='recaptcha']", "iframe[src*='hcaptcha']", "iframe[src*='turnstile']", ".g-recaptcha", "#captcha"];
+
 const SEL = {
-  loginUrl: envStr("QK_LOGIN_URL", envStr("SEL_LOGIN_URL", "https://www.qksource.com/login")),
-  cjLoginBtn: envStr("SEL_CJ_BUTTON", "text=/Login via CJ|CJ/i"),
+  loginUrl: envStr("QK_LOGIN_URL", envStr("SEL_LOGIN_URL", "https://qksource.com/register.html")),
   cjEmail: envStr("SEL_CJ_EMAIL", 'input[type="email"], input[name="email"], input[name="username"], input[placeholder*="mail" i]'),
   cjPassword: envStr("SEL_CJ_PASSWORD", 'input[type="password"]'),
-  cjSubmit: envStr("SEL_CJ_SUBMIT", 'button[type="submit"], button:has-text("Sign in"), button:has-text("Login")'),
-  cjAuthorize: envStr("SEL_CJ_AUTHORIZE", "text=/Authorize|Allow|Agree|Confirm|Yetki/i"),
-  successCheck: envStr("SEL_SUCCESS", "text=/Dashboard|My Store|Welcome|Logout/i"),
+  cjSubmit: envStr("SEL_CJ_SUBMIT", 'button[type="submit"], button:has-text("Sign in"), button:has-text("Login"), button:has-text("Log in")'),
+  cjAuthorize: envStr("SEL_CJ_AUTHORIZE", "button:has-text('Authorize'), button:has-text('Allow'), button:has-text('Agree'), button:has-text('Confirm'), button:has-text('Yetki')"),
+  successCheck: envStr("SEL_SUCCESS", "text=/Dashboard|My Store|Logout|Sign out|Log out|Hesabım/i"),
   errorText: envStr("SEL_ERROR_TEXT", "text=/incorrect password|wrong password|invalid password|invalid credentials|login failed|account or password|username or password|şifre hatalı|şifre yanlış|hatalı şifre|密码错误|账号或密码|用户名或密码/i"),
 };
 
-const DEFAULT_CAPTCHA_SELECTORS = [
-  "iframe[src*='recaptcha']",
-  "iframe[src*='hcaptcha']",
-  "iframe[src*='turnstile']",
-  "iframe[title*='captcha' i]",
-  ".g-recaptcha",
-  "#captcha",
-  "text=/captcha|verification code|doğrulama kodu|güvenlik doğrulaması|verify you are human|security check|slide to verify|not a robot|robot değilim/i",
-];
-const captchaSelectors = envStr("SEL_CAPTCHA", "") ? [envStr("SEL_CAPTCHA", "")] : DEFAULT_CAPTCHA_SELECTORS;
-
 const TIMEOUTS = {
   openLogin: envMs("TIMEOUT_OPEN_LOGIN", 45000),
+  captcha: envMs("TIMEOUT_CAPTCHA", 20000),
   cjButton: envMs("TIMEOUT_CJ_BUTTON", 20000),
   popup: envMs("TIMEOUT_POPUP", 8000),
   navigation: envMs("TIMEOUT_NAVIGATION", 30000),
@@ -110,7 +113,9 @@ const TIMEOUTS = {
   success: envMs("TIMEOUT_SUCCESS", 45000),
 };
 
-// Adım 3, operatörün gördüğü "CJ giriş butonu bulunamadı" mesajıdır.
+const SESSION_TTL = envMs("SESSION_TTL_MS", 5 * 60 * 1000);
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const STEPS = {
   browser: {
     n: 1,
@@ -124,23 +129,32 @@ const STEPS = {
   openLogin: {
     n: 2,
     id: "open-login",
-    name: "Login sayfasını aç",
+    name: "Kayıt sayfasını aç",
     selectorEnv: "QK_LOGIN_URL",
-    timeoutLabel: "Login sayfası açılamadı",
-    missingLabel: "Login sayfası açılamadı",
-    genericLabel: "Login sayfası açılamadı",
+    timeoutLabel: "Kayıt sayfası açılamadı",
+    missingLabel: "Kayıt sayfası açılamadı",
+    genericLabel: "Kayıt sayfası açılamadı",
+  },
+  captcha: {
+    n: 3,
+    id: "captcha",
+    name: "Doğrulama kodunu gönder",
+    selectorEnv: "SEL_CAPTCHA_INPUT",
+    timeoutLabel: "Doğrulama kodu gönderilemedi",
+    missingLabel: "Doğrulama kodu alanı bulunamadı",
+    genericLabel: "Doğrulama kodu gönderilemedi",
   },
   cjButton: {
-    n: 3,
+    n: 4,
     id: "cj-button",
-    name: "CJ giriş butonuna tıkla",
+    name: "CJ ikonuna tıkla",
     selectorEnv: "SEL_CJ_BUTTON",
-    timeoutLabel: "CJ giriş butonuna tıklanamadı",
-    missingLabel: "CJ giriş butonu bulunamadı",
-    genericLabel: "CJ giriş butonuna tıklanamadı",
+    timeoutLabel: "CJ giriş ikonuna tıklanamadı",
+    missingLabel: "CJ giriş ikonu bulunamadı",
+    genericLabel: "CJ giriş ikonuna tıklanamadı",
   },
   popup: {
-    n: 4,
+    n: 5,
     id: "popup",
     name: "Popup veya yönlendirmeyi algıla",
     selectorEnv: null,
@@ -149,7 +163,7 @@ const STEPS = {
     genericLabel: "CJ penceresi veya yönlendirme algılanamadı",
   },
   email: {
-    n: 5,
+    n: 6,
     id: "fill-email",
     name: "E-postayı doldur",
     selectorEnv: "SEL_CJ_EMAIL",
@@ -158,7 +172,7 @@ const STEPS = {
     genericLabel: "CJ e-posta alanı doldurulamadı",
   },
   password: {
-    n: 6,
+    n: 7,
     id: "fill-password",
     name: "Şifreyi doldur",
     selectorEnv: "SEL_CJ_PASSWORD",
@@ -167,7 +181,7 @@ const STEPS = {
     genericLabel: "CJ şifre alanı doldurulamadı",
   },
   submit: {
-    n: 7,
+    n: 8,
     id: "submit",
     name: "Girişi gönder",
     selectorEnv: "SEL_CJ_SUBMIT",
@@ -176,7 +190,7 @@ const STEPS = {
     genericLabel: "CJ giriş formu gönderilemedi",
   },
   authorize: {
-    n: 8,
+    n: 9,
     id: "authorize",
     name: "Yetki ekranını onayla",
     selectorEnv: "SEL_CJ_AUTHORIZE",
@@ -185,7 +199,7 @@ const STEPS = {
     genericLabel: "CJ yetki ekranı onaylanamadı",
   },
   success: {
-    n: 9,
+    n: 10,
     id: "wait-success",
     name: "Başarıyı bekle",
     selectorEnv: "SEL_SUCCESS",
@@ -195,8 +209,9 @@ const STEPS = {
   },
 };
 
+const PHASES = ["cjButton", "popup", "email", "password", "submit", "authorize", "success"];
+
 const CREDENTIAL_RE = /incorrect password|wrong password|invalid password|invalid credentials|incorrect email or password|account or password|username or password|login failed|password is incorrect|şifre hatalı|şifre yanlış|hatalı şifre|yanlış şifre|密码错误|账号或密码|用户名或密码/i;
-const CAPTCHA_RE = /captcha|recaptcha|hcaptcha|verification code|doğrulama kodu|güvenlik doğrulaması|verify you are human|security check|slide to verify|not a robot|robot değilim/i;
 
 function isTimeout(err) {
   const msg = String(err?.message || "");
@@ -212,7 +227,7 @@ function isBadSelector(err) {
 }
 
 function isTransientNavigation(err) {
-  if (!err || err.blockerKind || err.handled || err.code === "bad-url" || isBadSelector(err)) return false;
+  if (!err || err.blockerKind || err.handled || err.captchaPause || err.code === "bad-url" || isBadSelector(err)) return false;
   const msg = `${err.name || ""} ${err.message || ""}`;
   return /TimeoutError|timeout|timed out|net::ERR_|NS_ERROR_|frame was detached|Execution context was destroyed|Navigation failed|ERR_CONNECTION|ERR_NETWORK|ERR_ABORTED|ERR_EMPTY_RESPONSE|ECONNRESET|ECONNREFUSED|socket hang up/i.test(msg);
 }
@@ -226,15 +241,15 @@ function blockerError(kind) {
 
 function messageFor(step, err) {
   const n = step.n;
-  if (err?.blockerKind === "captcha") return `Adım ${n}: Captcha veya doğrulama kodu sayfası algılandı`;
   if (err?.blockerKind === "credentials") return `Adım ${n}: CJ kimlik bilgileri reddedildi`;
-  if (err?.code === "bad-url") return `Adım ${n}: Login adresi geçersiz (QK_LOGIN_URL)`;
+  if (err?.code === "bad-url") return `Adım ${n}: Kayıt adresi geçersiz (QK_LOGIN_URL)`;
+  if (err?.code === "no-redirect") return `Adım ${n}: CJ penceresi veya yönlendirme algılanamadı`;
   if (isBadSelector(err)) return `Adım ${n}: seçici geçersiz (${step.selectorEnv || "seçici"})`;
   if (step.id === "browser") {
     return isTimeout(err) ? `Adım ${n}: Tarayıcı başlatılamadı (zaman aşımı)` : `Adım ${n}: Tarayıcı başlatılamadı`;
   }
   if (step.id === "cj-button" && (err?.code === "missing-button" || isMissing(err))) {
-    return isTimeout(err) ? `Adım ${n}: CJ giriş butonu bulunamadı (zaman aşımı)` : `Adım ${n}: CJ giriş butonu bulunamadı`;
+    return isTimeout(err) ? `Adım ${n}: CJ giriş ikonu bulunamadı (zaman aşımı)` : `Adım ${n}: CJ giriş ikonu bulunamadı`;
   }
   if (isTimeout(err)) return `Adım ${n}: ${step.timeoutLabel} (zaman aşımı)`;
   if (isMissing(err)) return `Adım ${n}: ${step.missingLabel}`;
@@ -242,7 +257,7 @@ function messageFor(step, err) {
 }
 
 function blockerKindOf(step, err) {
-  if (err?.blockerKind === "captcha" || err?.blockerKind === "credentials") return err.blockerKind;
+  if (err?.blockerKind === "credentials") return "credentials";
   if (isBadSelector(err)) return "selector";
   if (isTimeout(err)) return "timeout";
   if (step.id === "browser") return "browser";
@@ -270,7 +285,6 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Playwright'in kendi zamanlayıcısı, kopuk bir gezinmeden sonra ateşlenmeyebilir.
 function withDeadline(work, ms) {
   let timer;
   const promise = Promise.resolve().then(work);
@@ -285,9 +299,9 @@ function withDeadline(work, ms) {
   return Promise.race([promise, timeout]);
 }
 
-async function selectorVisible(page, selector) {
+async function selectorVisible(root, selector) {
   try {
-    return await page.locator(selector).first().isVisible();
+    return await root.locator(selector).first().isVisible();
   } catch (err) {
     if (isBadSelector(err)) {
       warnOnce(`selector:${selector}`, {
@@ -302,27 +316,38 @@ async function selectorVisible(page, selector) {
   }
 }
 
-async function anyVisible(page, selectors) {
+async function anyVisible(root, selectors) {
   for (const selector of selectors) {
-    if (await selectorVisible(page, selector)) return true;
+    if (await selectorVisible(root, selector)) return true;
   }
   return false;
 }
 
-async function detectBlocker(page, { credentials = true, text = true } = {}) {
-  if (!pageOpen(page)) return null;
-  if (await anyVisible(page, captchaSelectors)) return { kind: "captcha" };
-  if (credentials && await selectorVisible(page, SEL.errorText)) return { kind: "credentials" };
-  if (!text) return null;
+async function frameHasCaptcha(frame) {
+  if (await anyVisible(frame, CAPTCHA_WIDGETS)) return true;
+  const prompt = await frame.locator("text=/we would like to make sure you are not a robot|please enter verification code|doğrulama kodu|not a robot/i").first().isVisible().catch(() => false);
+  if (!prompt) return false;
+  return frame.locator(CAPTCHA_INPUT).first().isVisible().catch(() => false);
+}
+
+async function isCaptchaPage(page) {
+  if (!pageOpen(page)) return false;
+  for (const frame of page.frames()) {
+    if (await frameHasCaptcha(frame).catch(() => false)) return true;
+  }
+  return false;
+}
+
+async function detectCredentials(page) {
+  if (!pageOpen(page)) return false;
+  if (await selectorVisible(page, SEL.errorText)) return true;
   let sample = "";
   try {
     sample = (await page.locator("body").innerText({ timeout: 1000 })).slice(0, 4000);
   } catch {
     sample = "";
   }
-  if (CAPTCHA_RE.test(sample)) return { kind: "captcha" };
-  if (credentials && CREDENTIAL_RE.test(sample)) return { kind: "credentials" };
-  return null;
+  return CREDENTIAL_RE.test(sample);
 }
 
 async function takeScreenshot(page) {
@@ -333,6 +358,57 @@ async function takeScreenshot(page) {
   } catch {
     return null;
   }
+}
+
+// Kod çözülmez. Operatörün göreceği resim, doğrulama alanının üstündeki görseldir.
+async function captureCaptchaImage(page) {
+  if (!pageOpen(page)) return null;
+  if (CAPTCHA_IMAGE) {
+    try {
+      const loc = page.locator(CAPTCHA_IMAGE).first();
+      if (await loc.isVisible().catch(() => false)) {
+        return (await loc.screenshot({ timeout: 5000 })).toString("base64");
+      }
+    } catch {
+      // Aşağıdaki yerleşim yedeğine düş.
+    }
+  }
+  for (const frame of page.frames()) {
+    let handle;
+    try {
+      handle = await frame.evaluateHandle(() => {
+        const visible = (el) => {
+          if (!el?.getClientRects?.().length) return false;
+          const s = getComputedStyle(el);
+          return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
+        };
+        const input = [...document.querySelectorAll("input")].find((el) => visible(el) && /verification code|doğrulama kodu|captcha|verify/i.test(`${el.getAttribute("placeholder") || ""} ${el.getAttribute("aria-label") || ""} ${el.name || ""} ${el.id || ""}`));
+        const media = [...document.querySelectorAll("img, canvas")].filter(visible);
+        if (input && media.length) {
+          const ir = input.getBoundingClientRect();
+          const above = media
+            .map((el) => ({ el, r: el.getBoundingClientRect() }))
+            .filter(({ r }) => r.width > 16 && r.height > 10 && r.bottom <= ir.top + 12)
+            .sort((a, b) => (ir.top - a.r.bottom) - (ir.top - b.r.bottom));
+          if (above[0]) return above[0].el;
+        }
+        return media.find((el) => /captcha|verify|code/i.test(`${el.getAttribute("src") || ""} ${el.getAttribute("alt") || ""} ${el.id || ""}`)) || null;
+      });
+    } catch {
+      continue;
+    }
+    const el = handle.asElement();
+    if (!el) {
+      await handle.dispose().catch(() => {});
+      continue;
+    }
+    try {
+      return (await el.screenshot({ timeout: 5000 })).toString("base64");
+    } catch {
+      await el.dispose().catch(() => {});
+    }
+  }
+  return takeScreenshot(page);
 }
 
 async function withNavRetry(ctx, step, fn, { recover, timeoutMs } = {}) {
@@ -348,21 +424,18 @@ async function withNavRetry(ctx, step, fn, { recover, timeoutMs } = {}) {
       stepName: step.name,
       event: "retry",
       email: ctx.email,
+      sessionId: ctx.id,
       url: currentUrl(ctx.active),
       message: `Adım ${step.n}: geçici gezinme hatası, bir kez yeniden deneniyor`,
       detail: err?.message,
     });
-    // Zaman aşımında ilk gezinme soketi açık kalabilir; yeniden denemeden önce sayfayı değiştir.
     if (recover) await withDeadline(recover, 3000).catch(() => {});
     return await run();
   }
 }
 
 async function replacePage(ctx) {
-  await Promise.race([
-    ctx.page?.close().catch(() => {}),
-    delay(1500),
-  ]);
+  await Promise.race([ctx.page?.close().catch(() => {}), delay(1500)]);
   ctx.page = await withDeadline(() => ctx.context.newPage(), 3000);
   ctx.active = ctx.page;
 }
@@ -390,6 +463,46 @@ function isHttpUrl(value) {
   }
 }
 
+function findCjInDocument() {
+  const textOf = (el) => {
+    const cls = typeof el.className === "string" ? el.className : (el.getAttribute?.("class") || "");
+    return [el.getAttribute?.("src"), el.getAttribute?.("href"), el.getAttribute?.("alt"), el.getAttribute?.("aria-label"), el.getAttribute?.("title"), cls].filter(Boolean).join(" ");
+  };
+  const visible = (el) => {
+    if (!el?.getClientRects?.().length) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
+  };
+  const nodes = [...document.querySelectorAll("img, a, button, [role='button'], svg, i, span")];
+  const cj = nodes.find((el) => visible(el) && /cj/i.test(textOf(el)));
+  if (cj) return cj.closest("a, button, [role='button']") || cj;
+  const wa = nodes.find((el) => visible(el) && /whatsapp/i.test(textOf(el)));
+  if (!wa) return null;
+  let row = wa.parentElement;
+  for (let i = 0; i < 5 && row; i += 1) {
+    if (row.children.length >= 4) break;
+    row = row.parentElement;
+  }
+  const first = row?.children?.[0];
+  if (!first || first === wa || first.contains(wa)) return null;
+  return first.querySelector("img, a, button") || first;
+}
+
+async function findCj(page) {
+  for (const frame of page.frames()) {
+    let handle;
+    try {
+      handle = await frame.evaluateHandle(findCjInDocument);
+    } catch {
+      continue;
+    }
+    const el = handle.asElement();
+    if (el) return el;
+    await handle.dispose().catch(() => {});
+  }
+  return null;
+}
+
 async function runStep(ctx, step, fn) {
   log({
     level: "info",
@@ -398,6 +511,7 @@ async function runStep(ctx, step, fn) {
     stepName: step.name,
     event: "start",
     email: ctx.email,
+    sessionId: ctx.id,
     url: currentUrl(ctx.active),
     message: `Adım ${step.n} başladı: ${step.name}`,
   });
@@ -410,19 +524,43 @@ async function runStep(ctx, step, fn) {
       stepName: step.name,
       event: "ok",
       email: ctx.email,
+      sessionId: ctx.id,
       url: currentUrl(ctx.active),
       message: `Adım ${step.n} tamam: ${step.name}`,
     });
   } catch (err) {
-    if (err?.handled) throw err;
-    let blocker = null;
-    if (!err?.blockerKind && step.id !== "browser") {
-      blocker = await withDeadline(
-        () => detectBlocker(ctx.active, { credentials: step.n >= STEPS.submit.n }),
-        2500,
-      ).catch(() => null);
-      if (blocker && !err.blockerKind) err.blockerKind = blocker.kind;
+    if (err?.captchaPause) {
+      if (!err.image) err.image = await captureCaptchaImage(ctx.active || ctx.page).catch(() => null);
+      log({
+        level: "info",
+        step: "captcha",
+        event: "pause",
+        email: ctx.email,
+        sessionId: ctx.id,
+        url: currentUrl(ctx.active),
+        message: "Doğrulama kodu bekleniyor",
+      });
+      throw err;
     }
+    if (err?.handled) throw err;
+    if (await isCaptchaPage(ctx.active || ctx.page).catch(() => false)) {
+      const pause = new Error("captcha");
+      pause.captchaPause = true;
+      pause.image = await captureCaptchaImage(ctx.active || ctx.page).catch(() => null);
+      log({
+        level: "info",
+        step: "captcha",
+        event: "pause",
+        email: ctx.email,
+        sessionId: ctx.id,
+        url: currentUrl(ctx.active),
+        message: "Doğrulama kodu bekleniyor",
+      });
+      throw pause;
+    }
+    let credentials = false;
+    if (step.n >= STEPS.submit.n) credentials = await detectCredentials(ctx.active).catch(() => false);
+    if (credentials) err.blockerKind = "credentials";
     const message = messageFor(step, err);
     const url = currentUrl(ctx.active) || currentUrl(ctx.page);
     const screenshot = await withDeadline(
@@ -437,6 +575,7 @@ async function runStep(ctx, step, fn) {
       stepName: step.name,
       event: "fail",
       email: ctx.email,
+      sessionId: ctx.id,
       url,
       message,
       detail: err?.message,
@@ -453,207 +592,317 @@ async function runStep(ctx, step, fn) {
   }
 }
 
-async function onboard({ cjEmail, cjPassword }) {
-  activeSecret = String(cjPassword);
-  const ctx = {
-    email: String(cjEmail),
-    browser: null,
-    context: null,
-    page: null,
-    active: null,
-    popup: null,
-    pendingPopup: null,
-  };
-
-  try {
-    await runStep(ctx, STEPS.browser, async () => {
-      ctx.browser = await chromium.launch({
-        headless: true,
-        args: ["--no-sandbox", "--disable-dev-shm-usage"],
-      });
-      ctx.context = await ctx.browser.newContext({ viewport: { width: 1280, height: 900 } });
-      ctx.page = await ctx.context.newPage();
-      ctx.active = ctx.page;
+function armTimeout(session) {
+  clearTimeout(session.timer);
+  session.timer = setTimeout(() => {
+    log({
+      level: "warn",
+      step: "session",
+      event: "expire",
+      email: session.email,
+      sessionId: session.id,
+      message: "Oturum zaman aşımı, tarayıcı kapatılıyor",
     });
+    void closeSession(session.id);
+  }, SESSION_TTL);
+}
 
-    await runStep(ctx, STEPS.openLogin, async () => {
-      if (!isHttpUrl(SEL.loginUrl)) throw Object.assign(new Error("bad-url"), { code: "bad-url" });
-      await withNavRetry(ctx, STEPS.openLogin, () => ctx.page.goto(SEL.loginUrl, { waitUntil: "domcontentloaded", timeout: TIMEOUTS.openLogin }), {
-        recover: () => replacePage(ctx),
-        timeoutMs: TIMEOUTS.openLogin,
-      });
-    });
+async function closeSession(id) {
+  const session = sessions.get(id);
+  if (!session || session.closing) return;
+  session.closing = true;
+  clearTimeout(session.timer);
+  sessions.delete(id);
+  if (activeSessionId === id) activeSessionId = null;
+  session.password = "";
+  const browser = session.browser;
+  session.browser = null;
+  await closeBrowser(browser);
+}
 
-    await runStep(ctx, STEPS.cjButton, async () => {
-      const btn = ctx.page.locator(SEL.cjLoginBtn).first();
+function captchaResult(session, image) {
+  armTimeout(session);
+  log({
+    level: "info",
+    step: "captcha",
+    event: "pause",
+    email: session.email,
+    sessionId: session.id,
+    url: currentUrl(session.active),
+    message: "Doğrulama kodu bekleniyor",
+  });
+  return { status: "captcha", sessionId: session.id, image };
+}
+
+async function drive(session) {
+  while (session.phaseIndex < PHASES.length) {
+    if (session.closing) throw Object.assign(new Error("expired"), { code: "expired" });
+    const page = pageOpen(session.active) ? session.active : session.page;
+    session.active = page;
+    if (await isCaptchaPage(page)) {
+      return captchaResult(session, await captureCaptchaImage(page));
+    }
+    const key = PHASES[session.phaseIndex];
+    try {
+      await runStep(session, STEPS[key], () => STEP_FNS[key](session));
+    } catch (err) {
+      if (err?.captchaPause) return captchaResult(session, err.image || null);
+      throw err;
+    }
+    session.phaseIndex += 1;
+  }
+  const url = currentUrl(session.page) || currentUrl(session.active);
+  log({
+    level: "info",
+    step: "onboard",
+    event: "done",
+    email: session.email,
+    sessionId: session.id,
+    url,
+    message: "CJ bağlantısı tamamlandı",
+  });
+  return { ok: true, status: "ok", url: url ? redact(url, 500) : null };
+}
+
+const STEP_FNS = {
+  async cjButton(session) {
+    const page = session.page;
+    if (CJ_BUTTON_OVERRIDE) {
+      const btn = page.locator(CJ_BUTTON_OVERRIDE).first();
       try {
         await btn.waitFor({ state: "visible", timeout: TIMEOUTS.cjButton });
       } catch (err) {
         if (isTimeout(err) || isMissing(err)) err.code = "missing-button";
         throw err;
       }
-      ctx.pendingPopup = ctx.context.waitForEvent("page", { timeout: TIMEOUTS.popup }).catch(() => null);
+      session.pendingPopup = session.context.waitForEvent("page", { timeout: TIMEOUTS.popup }).catch(() => null);
       await btn.click({ timeout: TIMEOUTS.cjButton });
-    });
-
-    await runStep(ctx, STEPS.popup, async () => {
-      const popup = await ctx.pendingPopup;
-      ctx.popup = popup || null;
-      const cj = popup || ctx.page;
-      ctx.active = cj;
+      return;
+    }
+    const deadline = Date.now() + TIMEOUTS.cjButton;
+    let el = null;
+    while (Date.now() < deadline) {
+      el = await findCj(page);
+      if (el) break;
+      await delay(200);
+    }
+    if (!el) throw Object.assign(new Error("missing-button"), { code: "missing-button" });
+    session.pendingPopup = session.context.waitForEvent("page", { timeout: TIMEOUTS.popup }).catch(() => null);
+    try {
+      await el.click({ timeout: TIMEOUTS.cjButton });
+    } finally {
+      await el.dispose().catch(() => {});
+    }
+  },
+  async popup(session) {
+    const popup = await session.pendingPopup;
+    session.pendingPopup = null;
+    session.popup = popup || null;
+    if (popup) {
+      session.active = popup;
+      await withNavRetry(session, STEPS.popup, () => popup.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }), {
+        timeoutMs: TIMEOUTS.navigation,
+      });
       log({
         level: "info",
         step: STEPS.popup.id,
         stepNo: STEPS.popup.n,
         stepName: STEPS.popup.name,
-        event: popup ? "popup" : "same-tab",
-        email: ctx.email,
-        url: currentUrl(cj),
-        message: popup ? "CJ penceresi açıldı" : "Aynı sekmede devam ediliyor",
+        event: "popup",
+        email: session.email,
+        sessionId: session.id,
+        url: currentUrl(popup),
+        message: "CJ penceresi açıldı",
       });
-      await withNavRetry(ctx, STEPS.popup, () => cj.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }), {
-        timeoutMs: TIMEOUTS.navigation,
-      });
-      const blocker = await detectBlocker(cj, { credentials: false });
-      if (blocker?.kind === "captcha") throw blockerError("captcha");
-    });
-
-    await runStep(ctx, STEPS.email, async () => {
-      const blocker = await detectBlocker(ctx.active, { credentials: false });
-      if (blocker?.kind === "captcha") throw blockerError("captcha");
-      await ctx.active.locator(SEL.cjEmail).first().fill(ctx.email, { timeout: TIMEOUTS.email });
-    });
-
-    await runStep(ctx, STEPS.password, async () => {
-      const blocker = await detectBlocker(ctx.active, { credentials: false });
-      if (blocker?.kind === "captcha") throw blockerError("captcha");
-      await ctx.active.locator(SEL.cjPassword).first().fill(cjPassword, { timeout: TIMEOUTS.password });
-    });
-
-    await runStep(ctx, STEPS.submit, async () => {
-      const page = ctx.active;
-      try {
-        await page.locator(SEL.cjSubmit).first().click({ timeout: TIMEOUTS.submit });
-      } catch (err) {
-        // Popup, gönderimden sonra kapanabilir; tıklama sayfayı kapatmışsa adım tamamdır.
-        if (!pageOpen(page)) return;
-        throw err;
-      }
-      if (pageOpen(page)) {
-        await page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.submit }).catch(() => {});
-        await delay(300);
-      }
-      const blocker = await detectBlocker(page, { credentials: true });
-      if (blocker) throw blockerError(blocker.kind);
-    });
-
-    await runStep(ctx, STEPS.authorize, async () => {
-      if (!pageOpen(ctx.active)) ctx.active = ctx.page;
-      if (pageOpen(ctx.active)) {
-        const auth = ctx.active.locator(SEL.cjAuthorize).first();
-        let visible = false;
-        try {
-          await auth.waitFor({ state: "visible", timeout: TIMEOUTS.authorize });
-          visible = true;
-        } catch (err) {
-          if (!isTimeout(err)) throw err;
-        }
-        if (visible) await auth.click({ timeout: TIMEOUTS.authorize });
-        else {
-          log({
-            level: "info",
-            step: STEPS.authorize.id,
-            stepNo: STEPS.authorize.n,
-            stepName: STEPS.authorize.name,
-            event: "skip",
-            email: ctx.email,
-            url: currentUrl(ctx.active),
-            message: "Yetki ekranı görünmedi, adım atlandı",
-          });
-        }
-      }
-      if (ctx.popup && pageOpen(ctx.popup)) {
-        await ctx.popup.waitForEvent("close", { timeout: TIMEOUTS.authorize }).catch(() => {});
-      }
-      if (pageOpen(ctx.page)) ctx.active = ctx.page;
-      const blocker = await detectBlocker(ctx.active, { credentials: true });
-      if (blocker) throw blockerError(blocker.kind);
-    });
-
-    await runStep(ctx, STEPS.success, async () => {
-      const page = pageOpen(ctx.page) ? ctx.page : ctx.active;
-      ctx.active = page;
-      const success = page.locator(SEL.successCheck).first();
-      const deadline = Date.now() + TIMEOUTS.success;
-      let tick = 0;
-      const successVisible = async () => {
-        try {
-          return await success.isVisible();
-        } catch (err) {
-          if (isBadSelector(err)) throw err;
-          return false;
-        }
-      };
-      while (Date.now() < deadline) {
-        if (await successVisible()) return;
-        const blocker = await detectBlocker(page, { credentials: true, text: tick % 4 === 0 });
-        if (blocker) throw blockerError(blocker.kind);
-        tick += 1;
-        await delay(Math.min(400, Math.max(0, deadline - Date.now())));
-      }
-      if (await successVisible()) return;
-      const blocker = await detectBlocker(page, { credentials: true, text: true });
-      if (blocker) throw blockerError(blocker.kind);
-      throw Object.assign(new Error("Timeout exceeded while waiting for success"), { name: "TimeoutError" });
-    });
-
-    const url = currentUrl(ctx.page);
+      return;
+    }
+    session.active = session.page;
+    await session.page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }).catch(() => {});
+    const stillRegister = await session.page.locator("text=/Create a Qksource account|Confirm Password/i").first().isVisible().catch(() => false);
+    const url = currentUrl(session.page) || "";
+    if (stillRegister && !/cjdropshipping|cj\.com/i.test(url)) {
+      throw Object.assign(new Error("no-redirect"), { code: "no-redirect" });
+    }
     log({
       level: "info",
-      step: "onboard",
-      event: "done",
-      email: ctx.email,
+      step: STEPS.popup.id,
+      stepNo: STEPS.popup.n,
+      stepName: STEPS.popup.name,
+      event: "same-tab",
+      email: session.email,
+      sessionId: session.id,
       url,
-      message: "CJ bağlantısı tamamlandı",
+      message: "Aynı sekmede devam ediliyor",
     });
-    return { ok: true, url: url ? redact(url, 500) : null };
-  } catch (err) {
-    if (err?.handled) {
-      return {
-        ok: false,
-        error: redact(err.message, 500),
-        step: err.stepId,
-        url: err.url ?? null,
-        screenshot: err.screenshot ?? null,
-        blocker: err.blocker ?? null,
-      };
+  },
+  async email(session) {
+    const page = session.active;
+    await page.locator(SEL.cjEmail).first().fill(session.email, { timeout: TIMEOUTS.email });
+  },
+  async password(session) {
+    const page = session.active;
+    await page.locator(SEL.cjPassword).first().fill(session.password, { timeout: TIMEOUTS.password });
+  },
+  async submit(session) {
+    const page = session.active;
+    try {
+      await page.locator(SEL.cjSubmit).first().click({ timeout: TIMEOUTS.submit });
+    } catch (err) {
+      if (!pageOpen(page)) return;
+      throw err;
     }
-    const url = currentUrl(ctx.active) || currentUrl(ctx.page);
-    const screenshot = (await takeScreenshot(ctx.active)) || (await takeScreenshot(ctx.page));
-    log({
-      level: "error",
-      step: "onboard",
-      event: "fail",
-      email: ctx.email,
-      url,
-      message: "Beklenmeyen otomasyon hatası",
-      detail: err?.message,
+    if (pageOpen(page)) {
+      await page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.submit }).catch(() => {});
+      await delay(300);
+    }
+    if (await detectCredentials(page)) throw blockerError("credentials");
+  },
+  async authorize(session) {
+    if (!pageOpen(session.active)) session.active = session.page;
+    if (pageOpen(session.active)) {
+      const auth = session.active.locator(SEL.cjAuthorize).first();
+      let visible = false;
+      try {
+        await auth.waitFor({ state: "visible", timeout: TIMEOUTS.authorize });
+        visible = true;
+      } catch (err) {
+        if (!isTimeout(err)) throw err;
+      }
+      if (visible) await auth.click({ timeout: TIMEOUTS.authorize });
+      else {
+        log({
+          level: "info",
+          step: STEPS.authorize.id,
+          stepNo: STEPS.authorize.n,
+          stepName: STEPS.authorize.name,
+          event: "skip",
+          email: session.email,
+          sessionId: session.id,
+          url: currentUrl(session.active),
+          message: "Yetki ekranı görünmedi, adım atlandı",
+        });
+      }
+    }
+    if (session.popup && pageOpen(session.popup)) {
+      await session.popup.waitForEvent("close", { timeout: TIMEOUTS.authorize }).catch(() => {});
+    }
+    if (pageOpen(session.page)) session.active = session.page;
+    if (await detectCredentials(session.active)) throw blockerError("credentials");
+  },
+  async success(session) {
+    const page = pageOpen(session.page) ? session.page : session.active;
+    session.active = page;
+    const success = page.locator(SEL.successCheck).first();
+    const deadline = Date.now() + TIMEOUTS.success;
+    const successVisible = async () => {
+      try {
+        return await success.isVisible();
+      } catch (err) {
+        if (isBadSelector(err)) throw err;
+        return false;
+      }
+    };
+    while (Date.now() < deadline) {
+      if (await isCaptchaPage(page)) {
+        const pause = new Error("captcha");
+        pause.captchaPause = true;
+        throw pause;
+      }
+      if (await successVisible()) return;
+      if (await detectCredentials(page)) throw blockerError("credentials");
+      await delay(Math.min(400, Math.max(0, deadline - Date.now())));
+    }
+    if (await successVisible()) return;
+    if (await isCaptchaPage(page)) {
+      const pause = new Error("captcha");
+      pause.captchaPause = true;
+      throw pause;
+    }
+    if (await detectCredentials(page)) throw blockerError("credentials");
+    throw Object.assign(new Error("Timeout exceeded while waiting for success"), { name: "TimeoutError" });
+  },
+};
+
+async function openRegister(session) {
+  await runStep(session, STEPS.browser, async () => {
+    session.browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage"],
     });
+    session.context = await session.browser.newContext({ viewport: { width: 1280, height: 900 } });
+    session.page = await session.context.newPage();
+    session.active = session.page;
+  });
+  await runStep(session, STEPS.openLogin, async () => {
+    if (!isHttpUrl(SEL.loginUrl)) throw Object.assign(new Error("bad-url"), { code: "bad-url" });
+    await withNavRetry(session, STEPS.openLogin, () => session.page.goto(SEL.loginUrl, { waitUntil: "domcontentloaded", timeout: TIMEOUTS.openLogin }), {
+      recover: () => replacePage(session),
+      timeoutMs: TIMEOUTS.openLogin,
+    });
+  });
+}
+
+async function submitCaptchaCode(session, code) {
+  const page = pageOpen(session.active) ? session.active : session.page;
+  session.active = page;
+  if (!(await isCaptchaPage(page))) return drive(session);
+  await runStep(session, STEPS.captcha, async () => {
+    const input = page.locator(CAPTCHA_INPUT).first();
+    await input.waitFor({ state: "visible", timeout: TIMEOUTS.captcha });
+    await input.fill(String(code), { timeout: TIMEOUTS.captcha });
+    try {
+      await page.locator(CAPTCHA_SUBMIT).first().click({ timeout: TIMEOUTS.captcha });
+    } catch (err) {
+      if (!pageOpen(page)) return;
+      throw err;
+    }
+    if (pageOpen(page)) {
+      await page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.captcha }).catch(() => {});
+      await delay(700);
+    }
+  });
+  return drive(session);
+}
+
+function failureBody(err, session) {
+  if (err?.code === "expired" || session?.closing) {
+    return { ok: false, status: "error", error: "Oturum bulunamadı veya süresi doldu", step: "session", url: null, screenshot: null, blocker: null };
+  }
+  if (err?.handled) {
     return {
       ok: false,
-      error: "Beklenmeyen otomasyon hatası",
-      step: "onboard",
-      url: url ? redact(url, 500) : null,
-      screenshot,
-      blocker: null,
+      status: "error",
+      error: redact(err.message, 500),
+      step: err.stepId,
+      url: err.url ?? null,
+      screenshot: err.screenshot ?? null,
+      blocker: err.blocker ?? null,
     };
+  }
+  return {
+    ok: false,
+    status: "error",
+    error: "Beklenmeyen otomasyon hatası",
+    step: "onboard",
+    url: currentUrl(session?.active) || currentUrl(session?.page),
+    screenshot: null,
+    blocker: null,
+  };
+}
+
+async function withSessionSecrets(session, code, fn) {
+  const secrets = [];
+  if (session?.password) secrets.push(String(session.password));
+  if (code && String(code).length >= 4) secrets.push(String(code));
+  activeSecrets = secrets;
+  try {
+    return await fn();
   } finally {
-    activeSecret = "";
-    await closeBrowser(ctx.browser);
+    activeSecrets = [];
   }
 }
 
-const configured = ["QK_LOGIN_URL", "SEL_LOGIN_URL", "SEL_CJ_BUTTON", "SEL_CJ_EMAIL", "SEL_CJ_PASSWORD", "SEL_CJ_SUBMIT", "SEL_CJ_AUTHORIZE", "SEL_SUCCESS", "SEL_ERROR_TEXT", "SEL_CAPTCHA", "TIMEOUT_OPEN_LOGIN", "TIMEOUT_CJ_BUTTON", "TIMEOUT_POPUP", "TIMEOUT_NAVIGATION", "TIMEOUT_EMAIL", "TIMEOUT_PASSWORD", "TIMEOUT_SUBMIT", "TIMEOUT_AUTHORIZE", "TIMEOUT_SUCCESS"]
+const configured = ["QK_LOGIN_URL", "SEL_LOGIN_URL", "SEL_CJ_BUTTON", "SEL_CJ_EMAIL", "SEL_CJ_PASSWORD", "SEL_CJ_SUBMIT", "SEL_CJ_AUTHORIZE", "SEL_SUCCESS", "SEL_ERROR_TEXT", "SEL_CAPTCHA", "SEL_CAPTCHA_INPUT", "SEL_CAPTCHA_SUBMIT", "SEL_CAPTCHA_IMAGE", "TIMEOUT_OPEN_LOGIN", "TIMEOUT_CAPTCHA", "TIMEOUT_CJ_BUTTON", "TIMEOUT_POPUP", "TIMEOUT_NAVIGATION", "TIMEOUT_EMAIL", "TIMEOUT_PASSWORD", "TIMEOUT_SUBMIT", "TIMEOUT_AUTHORIZE", "TIMEOUT_SUCCESS", "SESSION_TTL_MS"]
   .filter((name) => typeof process.env[name] === "string" && process.env[name].trim() !== "");
 log({ level: "info", step: "config", event: "env", message: configured.length ? `Ayarlı ortam değişkenleri: ${configured.join(", ")}` : "Seçici ve zaman aşımı varsayılanları kullanılıyor" });
 
@@ -664,27 +913,93 @@ app.get("/healthz", (_req, res) => {
   res.status(200).type("text/plain; charset=utf-8").send("ok");
 });
 
-let busy = false;
-
 app.post("/onboard", async (req, res) => {
   const { cjEmail, cjPassword } = req.body || {};
   if (typeof cjEmail !== "string" || typeof cjPassword !== "string" || cjEmail.length === 0 || cjPassword.length === 0) {
-    return res.status(400).json({ ok: false, error: "CJ e-posta ve şifre gerekli" });
+    return res.status(400).json({ ok: false, status: "error", error: "CJ e-posta ve şifre gerekli" });
   }
-  if (busy) {
+  if (sessions.size > 0) {
     log({ level: "warn", step: "onboard", event: "busy", email: cjEmail, message: "Başka bir işlem sürüyor" });
-    return res.status(429).json({ ok: false, error: "Başka bir işlem sürüyor, biraz sonra deneyin" });
+    return res.status(429).json({ ok: false, status: "error", error: "Başka bir işlem sürüyor, biraz sonra deneyin" });
   }
-  busy = true;
-  log({ level: "info", step: "onboard", event: "start", email: cjEmail, message: "Onboard başladı" });
+  const session = {
+    id: randomUUID(),
+    email: String(cjEmail),
+    password: String(cjPassword),
+    browser: null,
+    context: null,
+    page: null,
+    active: null,
+    popup: null,
+    pendingPopup: null,
+    phaseIndex: 0,
+    timer: null,
+    closing: false,
+  };
+  sessions.set(session.id, session);
+  activeSessionId = session.id;
+  armTimeout(session);
+  log({ level: "info", step: "onboard", event: "start", email: session.email, sessionId: session.id, message: "Onboard başladı" });
   try {
-    const result = await onboard({ cjEmail, cjPassword });
+    const result = await withSessionSecrets(session, null, async () => {
+      await openRegister(session);
+      return drive(session);
+    });
+    if (result.status !== "captcha") await closeSession(session.id);
     res.json(result);
   } catch (err) {
-    log({ level: "error", step: "onboard", event: "fail", email: cjEmail, message: "Beklenmeyen sunucu hatası", detail: err?.message });
-    res.status(500).json({ ok: false, error: "Beklenmeyen sunucu hatası", step: "onboard", url: null, screenshot: null, blocker: null });
+    log({
+      level: "error",
+      step: "onboard",
+      event: "fail",
+      email: session.email,
+      sessionId: session.id,
+      message: err?.handled ? err.message : "Beklenmeyen otomasyon hatası",
+      detail: err?.handled ? null : err?.message,
+    });
+    const body = failureBody(err, session);
+    await closeSession(session.id);
+    res.status(err?.handled ? 200 : 500).json(body);
+  }
+});
+
+app.post("/onboard/:sessionId/captcha", async (req, res) => {
+  const { sessionId } = req.params;
+  if (!SESSION_ID_RE.test(sessionId)) {
+    return res.status(404).json({ ok: false, status: "error", error: "Oturum bulunamadı veya süresi doldu" });
+  }
+  const session = sessions.get(sessionId);
+  if (!session || session.closing) {
+    return res.status(404).json({ ok: false, status: "error", error: "Oturum bulunamadı veya süresi doldu" });
+  }
+  const code = req.body?.code;
+  if (typeof code !== "string" || code.trim().length === 0 || code.length > 64) {
+    return res.status(400).json({ ok: false, status: "error", error: "Doğrulama kodu gerekli" });
+  }
+  if (session.busy) {
+    return res.status(429).json({ ok: false, status: "error", error: "Başka bir işlem sürüyor, biraz sonra deneyin" });
+  }
+  session.busy = true;
+  armTimeout(session);
+  try {
+    const result = await withSessionSecrets(session, code, () => submitCaptchaCode(session, code.trim()));
+    if (result.status !== "captcha") await closeSession(session.id);
+    res.json(result);
+  } catch (err) {
+    log({
+      level: "error",
+      step: "captcha",
+      event: "fail",
+      email: session.email,
+      sessionId: session.id,
+      message: err?.handled ? err.message : "Beklenmeyen otomasyon hatası",
+      detail: err?.handled ? null : err?.message,
+    });
+    const body = failureBody(err, session);
+    await closeSession(session.id);
+    res.status(err?.handled ? 200 : 500).json(body);
   } finally {
-    busy = false;
+    if (sessions.has(sessionId)) session.busy = false;
   }
 });
 
@@ -694,21 +1009,37 @@ app.get("/", (_req, res) => res.type("html").send(`<!doctype html><html lang="tr
 .c{background:#fff;padding:28px;border-radius:12px;box-shadow:0 2px 12px #0001;width:100%;max-width:440px}
 label{display:block;margin:14px 0 6px;font-weight:600}input{width:100%;padding:10px;border:1px solid #ccc;border-radius:8px;box-sizing:border-box}
 button{margin-top:20px;width:100%;padding:12px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:16px;cursor:pointer}
-button:disabled{background:#94a3b8}#r{margin-top:20px;word-break:break-all}.ok{color:#15803d}.err{color:#b91c1c}img{max-width:100%;margin-top:10px;border:1px solid #ddd}</style></head>
+button.black{background:#111}button:disabled{background:#94a3b8}#r{margin-top:20px;word-break:break-all}.ok{color:#15803d}.err{color:#b91c1c}
+img{max-width:100%;margin-top:10px;border:1px solid #ddd}#cap[hidden]{display:none}#cap img{display:block;margin:12px auto;background:#fff}
+.hint{color:#64748b;font-size:14px;margin-top:8px}</style></head>
 <body><div class="c"><h2>Qksource – CJ ile Hesap Aç</h2><form id="f">
 <label>CJ e-posta / kullanıcı adı</label><input name="cjEmail" required autocomplete="off">
 <label>CJ şifre</label><input name="cjPassword" type="password" required autocomplete="new-password">
-<button id="b">Başlat</button></form><div id="r"></div></div>
+<button id="b">Başlat</button></form>
+<div id="cap" hidden><p><strong>Doğrulama kodu</strong></p><p class="hint">Resimdeki kodu yazın. Büyük/küçük harf fark etmeyebilir. Yanlışsa yeni resim gelir.</p>
+<img id="capimg" alt="Doğrulama kodu"><label for="code">Kod</label><input id="code" autocomplete="off" placeholder="Please enter verification code">
+<button id="send" class="black" type="button">Gönder</button></div>
+<div id="r"></div></div>
 <script>
 const f=document.getElementById('f'),b=document.getElementById('b'),r=document.getElementById('r');
+const cap=document.getElementById('cap'),capimg=document.getElementById('capimg'),code=document.getElementById('code'),send=document.getElementById('send');
+let sessionId=null;
 const esc=s=>String(s??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-f.onsubmit=async e=>{e.preventDefault();b.disabled=true;b.textContent='Çalışıyor... (1-2 dk sürebilir)';r.innerHTML='';
-try{const d=Object.fromEntries(new FormData(f));const x=await fetch('/onboard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
-const j=await x.json();f.cjPassword.value='';
-if(j.ok){r.innerHTML='<p class="ok">✅ Başarılı</p><p>Son URL: '+esc(j.url)+'</p>';}
-else{r.innerHTML='<p class="err">❌ Hata: '+esc(j.error||x.status)+'</p>'+(j.url?'<p>URL: '+esc(j.url)+'</p>':'')+(j.screenshot?'<img alt="Hata ekran görüntüsü" src="data:image/png;base64,'+String(j.screenshot).replace(/[^A-Za-z0-9+/=]/g,'')+'">':'');}}
-catch(err){r.innerHTML='<p class="err">❌ '+esc(err.message)+'</p>';}
-b.disabled=false;b.textContent='Başlat';};
+function show(j){
+  if(j&&j.status==='captcha'){sessionId=j.sessionId;cap.hidden=false;capimg.src='data:image/png;base64,'+String(j.image||'').replace(/[^A-Za-z0-9+/=]/g,'');code.value='';code.focus();
+    r.innerHTML='<p class="hint">Oturum açık. Kodu gönderin.</p>';return;}
+  cap.hidden=true;sessionId=null;
+  if(j&&j.ok){r.innerHTML='<p class="ok">✅ Başarılı</p><p>Son URL: '+esc(j.url)+'</p>';}
+  else{r.innerHTML='<p class="err">❌ Hata: '+esc((j&&j.error)||'yanıt yok')+'</p>'+(j&&j.url?'<p>URL: '+esc(j.url)+'</p>':'')+(j&&j.screenshot?'<img alt="Hata ekran görüntüsü" src="data:image/png;base64,'+String(j.screenshot).replace(/[^A-Za-z0-9+/=]/g,'')+'">':'');}
+  b.disabled=false;b.textContent='Başlat';
+}
+f.onsubmit=async e=>{e.preventDefault();b.disabled=true;b.textContent='Çalışıyor...';r.innerHTML='';cap.hidden=true;
+try{const d=Object.fromEntries(new FormData(f));f.cjPassword.value='';const x=await fetch('/onboard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
+const j=await x.json();show(j);}catch(err){r.innerHTML='<p class="err">❌ '+esc(err.message)+'</p>';b.disabled=false;b.textContent='Başlat';}};
+send.onclick=async()=>{if(!sessionId)return;send.disabled=true;
+try{const x=await fetch('/onboard/'+encodeURIComponent(sessionId)+'/captcha',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:code.value})});
+const j=await x.json();show(j);}catch(err){r.innerHTML='<p class="err">❌ '+esc(err.message)+'</p>';}
+send.disabled=false;};
 </script></body></html>`));
 
 app.use((err, _req, res, next) => {
@@ -725,6 +1056,7 @@ app.use((err, _req, res, next) => {
   });
   res.status(code).json({
     ok: false,
+    status: "error",
     error: code === 400 ? "Geçersiz istek gövdesi" : "Beklenmeyen sunucu hatası",
   });
 });
