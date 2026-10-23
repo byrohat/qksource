@@ -3,7 +3,7 @@ services:
     name: qksource-onboard
     runtime: docker
     plan: starter
-    healthCheckPath: /healthz
+    healthCheckPath: /healthz # kimlik doğrulama yok; gövde "ok"
     envVars:
       - key: APP_PASSWORD
         sync: false
