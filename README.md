@@ -19,9 +19,10 @@ Arayüz ve API ayrı bir uygulama şifresi istemez.
 4. Operatör kodu yazar. Arayüz `POST /onboard/:sessionId/captcha` ile `{code}` gönderir. Sunucu alanı doldurur, Submit'e basar ve `register.html` yoluna gidişi ya da yeni bir doğrulama görselini bekler. Geçiş sırasında oluşan "Execution context was destroyed" yüzünden akış düşmez. Kod yanlışsa yeni `image` döner.
 5. Kod yanlışsa veya sayfa yeniden doğrulama isterse aynı oturumda yeni bir `image` döner.
 6. "Welcome to Qksource.com" kayıt penceresinde turuncu CJ ikonuna tıklanır. İkon, WhatsApp ile aynı satırda ve onun solundaki ilk simgedir (`src` / `href` / `class` / `alt` içinde `cj` varsa o tercih edilir). `SEL_CJ_BUTTON` tanımlıysa yalnızca o seçici kullanılır.
-7. Tıklama `context.waitForEvent('page')`, `page.waitForURL(/cjdropshipping/)` ve alt çerçevelerle birlikte beklenir. Hangisi gelirse CJ girişi orada yapılır: popup, aynı sekmede `cjdropshipping` yönlendirmesi veya iframe. E-posta/kullanıcı adı ve şifre yazılır, giriş gönderilir, izin düğmesi varsa tıklanır, dönüş qksource ana sayfasında beklenir (popup kapanır veya ana sayfa giriş yapılmış hale gelir).
-8. CJ yüzeyi bulunamazsa hata, açık sayfaların ve çerçevelerin adreslerini ve her sayfanın ekran görüntüsünü içerir.
-9. CJ tarafında da doğrulama kodu sayfası çıkarsa aynı duraklama kullanılır.
+7. Sosyal girişten önce, metni agree / terms / privacy / policy / sözleş / gizlilik / onay olan işaretlenmemiş bir kutu varsa işaretlenir.
+8. CJ ikonuna sırayla beş deneme yapılır. Her denemeden sonra en fazla `TIMEOUT_CJ_CLICK` (varsayılan 20 sn) popup, adres değişimi veya iframe beklenir: öğeye normal tıklama, üst `<a>` veya butona tıklama, `element.click()`, `href` varsa o adrese gitme, sayfa betiğinde `cjdropshipping` / `oauth` / `authorize` ile kurulmuş bir adres varsa ona gitme. `href` yoksa, `#` ise veya betikte böyle bir adres yoksa o deneme atlanır. Hangisi gelirse CJ girişi orada yapılır. E-posta/kullanıcı adı ve şifre yazılır, giriş gönderilir, izin düğmesi varsa tıklanır, dönüş qksource ana sayfasında beklenir.
+9. CJ yüzeyi bulunamazsa hata ve log, tıklamadan önce alınan sosyal ikon satırının ve seçilen öğenin HTML'ini (etiket, href, onclick, data-*), deneme sırasında biriken konsol mesajlarını ve başarısız istekleri, açık sayfaların adreslerini ve her sayfanın ekran görüntüsünü içerir.
+10. CJ tarafında da doğrulama kodu sayfası çıkarsa aynı duraklama kullanılır.
 
 Tarayıcı oturumu bellekte `sessionId` ile durur. Son işlemden sonra yaklaşık **5 dakika** (`SESSION_TTL_MS`, varsayılan `300000`) içinde kapanır. Başarı veya hatada da kapanır. Aynı anda tek oturum çalışır.
 
@@ -34,7 +35,7 @@ Hata olursa yanıt ve arayüz, başarısız adımı Türkçe söyler. Zaman aş�
 | 2 | Kayıt sayfasını aç | `Adım 2: Kayıt sayfası açılamadı (zaman aşımı)` |
 | 3 | Doğrulama kodunu gönder. CJ ikonundan önce bölge duvarı da burada raporlanır | `Adım 3: Doğrulama kodu alanı bulunamadı` |
 | 4 | CJ ikonuna tıkla | `Adım 4: CJ giriş ikonu bulunamadı` |
-| 5 | Popup, `cjdropshipping` yönlendirmesi veya iframe | `Adım 5: CJ penceresi veya yönlendirme algılanamadı` |
+| 5 | Sözleşme kutusu, sonra popup / yönlendirme / iframe. Olmazsa öğe HTML'i, konsol ve başarısız istekler | `Adım 5: CJ penceresi veya yönlendirme algılanamadı` |
 | 6 | E-postayı doldur | `Adım 6: CJ e-posta alanı bulunamadı` |
 | 7 | Şifreyi doldur | `Adım 7: CJ şifre alanı bulunamadı` |
 | 8 | Girişi gönder | `Adım 8: CJ giriş formu gönderilemedi` |
@@ -94,14 +95,15 @@ Boş bırakılırsa varsayılan kullanılır. `QK_LOGIN_URL` tanımlıysa `SEL_L
 | `SESSION_TTL_MS` | Oturumun açık kalma süresi | `300000` (5 dakika) |
 
 ## Adım zaman aşımları
-Milisaniye. Geçersiz veya boşsa varsayılan kullanılır. `PROXY_URL` doluysa ve ilgili değişken boşsa varsayılan **3 katına** çıkar (proxy yavaştır). Değişkeni elle verirseniz o değer kullanılır.
+Milisaniye. Geçersiz veya boşsa varsayılan kullanılır. `PROXY_URL` doluysa ve ilgili değişken boşsa varsayılan **3 katına** çıkar (proxy yavaştır). `TIMEOUT_CJ_CLICK` buna girmez; boşsa 20000 kalır. Değişkeni elle verirseniz o değer kullanılır.
 
 | Değişken | Adım | Varsayılan |
 | --- | --- | --- |
 | `TIMEOUT_OPEN_LOGIN` | 2, kayıt sayfası | `45000` |
 | `TIMEOUT_CAPTCHA` | 3, kodu yazıp gönderme | `20000` |
 | `TIMEOUT_CJ_BUTTON` | 4, CJ ikonu | `20000` |
-| `TIMEOUT_POPUP` | 5, popup bekleme | `8000` |
+| `TIMEOUT_CJ_CLICK` | 5, her tıklama denemesinden sonra popup, yönlendirme veya iframe | `20000`. Bu değişken proxy ile 3 katına çıkmaz |
+| `TIMEOUT_POPUP` | Eski adım 5 beklemesi. Yeni akış `TIMEOUT_CJ_CLICK` kullanır | `8000` |
 | `TIMEOUT_NAVIGATION` | 5, açılan sayfanın yüklenmesi | `30000` |
 | `TIMEOUT_EMAIL` | 6, e-posta | `30000` |
 | `TIMEOUT_PASSWORD` | 7, şifre | `30000` |
@@ -110,7 +112,7 @@ Milisaniye. Geçersiz veya boşsa varsayılan kullanılır. `PROXY_URL` doluysa 
 | `TIMEOUT_SUCCESS` | 10, başarı | `45000` |
 
 ## Loglar
-Her adım stdout'a tek satır JSON yazar (`step`, `stepNo`, `stepName`, `event`, `sessionId`, `url`, `message`). Duraklama `event:"pause"` ve `step:"captcha"` olarak görünür. CJ şifresi ve operatörün yazdığı doğrulama kodu loglanmaz; bir metne karışırsa `[REDACTED]` olur. Beklenmeyen süreç hataları `uncaughtException` / `unhandledRejection` olarak yazılır ve süreç kapanır.
+Her adım stdout'a tek satır JSON yazar (`step`, `stepNo`, `stepName`, `event`, `sessionId`, `url`, `message`). Duraklama `event:"pause"` ve `step:"captcha"` olarak görünür. CJ ikonu bulununca `event:"markup"` satırı, tıklamadan önce ikon satırının ve seçilen öğenin HTML'ini yazar. Adım 5 hata satırı aynı HTML'i, konsol mesajlarını ve başarısız istekleri de taşır. CJ şifresi ve operatörün yazdığı doğrulama kodu loglanmaz; bir metne karışırsa `[REDACTED]` olur. Beklenmeyen süreç hataları `uncaughtException` / `unhandledRejection` olarak yazılır ve süreç kapanır.
 
 ## Dikkat
 - Doğrulama kodu otomatik çözülmez. Resmi operatör okur.

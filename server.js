@@ -45,8 +45,8 @@ function log(entry) {
     email: entry.email ?? null,
     sessionId: entry.sessionId ?? null,
     url: entry.url == null ? null : redact(entry.url, 500),
-    message: entry.message == null ? null : redact(entry.message, 500),
-    detail: entry.detail == null ? null : redact(entry.detail, 500),
+    message: entry.message == null ? null : redact(entry.message, 9000),
+    detail: entry.detail == null ? null : redact(entry.detail, 9000),
     blocker: entry.blocker ?? null,
   };
   const line = JSON.stringify(payload);
@@ -284,7 +284,10 @@ function messageFor(step, err) {
   if (err?.code === "bad-proxy") return `Adım ${n}: PROXY_URL geçersiz`;
   if (err?.blockerKind === "credentials") return `Adım ${n}: CJ kimlik bilgileri reddedildi`;
   if (err?.code === "bad-url") return `Adım ${n}: Kayıt adresi geçersiz (QK_LOGIN_URL)`;
-  if (err?.code === "no-redirect") return `Adım ${n}: CJ penceresi veya yönlendirme algılanamadı. ${err.surfaces || ""}`.trim();
+  if (err?.code === "no-redirect") {
+    const extra = [err.surfaces, formatCjDiag(err.diag), err.trace].filter(Boolean).join(" | ");
+    return `Adım ${n}: CJ penceresi veya yönlendirme algılanamadı. ${extra}`.trim();
+  }
   if (err?.code === "not-left") return `Adım ${n}: CJ ikonu WhatsApp'ın solunda değil${err.position ? ` (${err.position})` : ""}`;
   if (isBadSelector(err)) return `Adım ${n}: seçici geçersiz (${step.selectorEnv || "seçici"})`;
   if (step.id === "browser") {
@@ -856,46 +859,398 @@ async function collectPageShots(session) {
   return shots;
 }
 
-function startCjWatch(session, timeout) {
+function cjStrategyWait() {
+  return envMs("TIMEOUT_CJ_CLICK", 20000);
+}
+
+function usableHref(href, base) {
+  const raw = String(href || "").trim();
+  if (!raw || raw === "#" || raw.startsWith("#") || /^javascript:/i.test(raw)) return null;
+  let url;
+  try {
+    url = new URL(raw, base || undefined);
+  } catch {
+    return null;
+  }
+  if (!/^https?:$/i.test(url.protocol)) return null;
+  try {
+    const current = new URL(base);
+    if (`${url.origin}${url.pathname}${url.search}` === `${current.origin}${current.pathname}${current.search}`) return null;
+  } catch {
+    // Taban adres yoksa aday yine de kullanılır.
+  }
+  return url.href;
+}
+
+function formatCjDiag(diag) {
+  if (!diag || typeof diag !== "object") return "";
+  const attrs = diag.attrs && typeof diag.attrs === "object"
+    ? Object.entries(diag.attrs).map(([key, value]) => `${key}=${value}`).join(" ")
+    : "";
+  return [
+    diag.tag ? `etiket=${diag.tag}` : "",
+    `href=${diag.href || "(yok)"}`,
+    `onclick=${diag.onclick || "(yok)"}`,
+    attrs ? `attr=${attrs}` : "",
+    diag.elementHtml ? `eleman=${diag.elementHtml}` : "",
+    diag.rowHtml ? `satır=${diag.rowHtml}` : "",
+    diag.oauth ? `oauth=${diag.oauth}` : "",
+    Array.isArray(diag.agreement) && diag.agreement.length ? `sozlesme=${diag.agreement.join(",")}` : "",
+    diag.strategies ? `denenen=${diag.strategies}` : "",
+  ].filter(Boolean).join(" | ");
+}
+
+function armSurfaceWatch(session) {
   const page = session.page;
   const startUrl = page.url();
-  const seen = { popup: null };
-  const popupWait = session.context.waitForEvent("page", { timeout }).then((popup) => {
-    seen.popup = popup;
-    return popup;
-  }).catch(() => null);
-  const urlWait = page.waitForURL(/cjdropshipping/i, { timeout, waitUntil: "domcontentloaded" }).then(() => true).catch(() => false);
-  return (async () => {
-    const deadline = Date.now() + timeout;
-    while (Date.now() < deadline) {
-      const popup = seen.popup;
-      if (popup && pageOpen(popup)) {
-        const popupUrl = currentUrl(popup) || "";
-        if (popupUrl && popupUrl !== "about:blank") return { kind: "popup", page: popup };
-      }
-      for (const candidate of session.context.pages()) {
-        if (candidate === page || !pageOpen(candidate)) continue;
+  const popups = [];
+  const onPage = (popup) => { popups.push(popup); };
+  session.context.on("page", onPage);
+  const look = async () => {
+    const candidates = [...popups];
+    for (const candidate of session.context.pages()) {
+      if (!candidates.includes(candidate)) candidates.push(candidate);
+    }
+    for (const candidate of candidates) {
+      if (!pageOpen(candidate)) continue;
+      if (candidate !== page) {
         const candidateUrl = currentUrl(candidate) || "";
-        if (isCjUrl(candidateUrl) || (candidateUrl && candidateUrl !== "about:blank")) return { kind: "popup", page: candidate };
+        if (candidateUrl && candidateUrl !== "about:blank") return { kind: "popup", page: candidate };
       }
-      const mainUrl = currentUrl(page) || "";
-      if (isCjUrl(mainUrl) || (pathOf(mainUrl) && pathOf(mainUrl) !== pathOf(startUrl))) return { kind: "redirect", page };
-      for (const frame of safeFrames(page)) {
-        if (frame === page.mainFrame()) continue;
+      for (const frame of safeFrames(candidate)) {
+        if (frame === candidate.mainFrame()) continue;
         let frameUrl = "";
         try { frameUrl = frame.url(); } catch { continue; }
         if (!frameUrl || frameUrl === "about:blank") continue;
-        if (isCjUrl(frameUrl) || /cjdropshipping/i.test(frameUrl)) return { kind: "frame", frame, page };
+        if (isCjUrl(frameUrl)) return { kind: "frame", frame, page: candidate };
         const emailVisible = await frame.locator(SEL.cjEmail).first().isVisible().catch(() => false);
-        if (emailVisible) return { kind: "frame", frame, page };
+        if (emailVisible) return { kind: "frame", frame, page: candidate };
       }
-      await delay(250);
     }
-    await popupWait;
-    await urlWait;
-    if (seen.popup && pageOpen(seen.popup)) return { kind: "popup", page: seen.popup };
+    const mainUrl = currentUrl(page) || "";
+    if (mainUrl && (isCjUrl(mainUrl) || (pathOf(mainUrl) && pathOf(mainUrl) !== pathOf(startUrl)))) {
+      return { kind: "redirect", page };
+    }
     return null;
-  })();
+  };
+  return {
+    async poll(timeout) {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        const target = await look().catch((err) => {
+          if (isContextDestroyed(err)) return null;
+          throw err;
+        });
+        if (target) return target;
+        await delay(200);
+      }
+      return look().catch(() => null);
+    },
+    stop() {
+      session.context?.off("page", onPage);
+    },
+  };
+}
+
+function attachClickTrace(session) {
+  const lines = [];
+  session.clickTrace = lines;
+  const push = (line) => {
+    if (lines.length >= 12) return;
+    lines.push(redact(line, 180));
+  };
+  const onConsole = (msg) => {
+    const type = msg.type();
+    if (type === "debug" || type === "verbose") return;
+    push(`konsol ${type}: ${msg.text()}`);
+  };
+  const onFailed = (req) => {
+    const url = req.url();
+    if (/favicon\.ico/i.test(url)) return;
+    push(`istek fail ${req.failure()?.errorText || "fail"} ${req.method()} ${url}`);
+  };
+  const onResponse = (res) => {
+    if (res.status() < 400) return;
+    const url = res.url();
+    if (/favicon\.ico/i.test(url)) return;
+    push(`istek ${res.status()} ${res.request().method()} ${url}`);
+  };
+  const pages = new Set();
+  const bindPage = (p) => {
+    if (!p || pages.has(p)) return;
+    pages.add(p);
+    p.on("console", onConsole);
+  };
+  bindPage(session.page);
+  const onPopup = (p) => bindPage(p);
+  session.context.on("page", onPopup);
+  session.context.on("requestfailed", onFailed);
+  session.context.on("response", onResponse);
+  return () => {
+    for (const p of pages) p.off("console", onConsole);
+    session.context?.off("page", onPopup);
+    session.context?.off("requestfailed", onFailed);
+    session.context?.off("response", onResponse);
+  };
+}
+
+async function readCjMarkup(el) {
+  return el.evaluate((node) => {
+    const clip = (value, n) => String(value || "").replace(/\s+/g, " ").trim().slice(0, n);
+    const textOf = (item) => {
+      const cls = typeof item.className === "string" ? item.className : (item.getAttribute?.("class") || "");
+      return [item.getAttribute?.("src"), item.getAttribute?.("href"), item.getAttribute?.("alt"), item.getAttribute?.("aria-label"), item.getAttribute?.("title"), cls].filter(Boolean).join(" ");
+    };
+    const visible = (item) => {
+      if (!item?.getClientRects?.().length) return false;
+      const s = getComputedStyle(item);
+      return s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
+    };
+    const wa = [...document.querySelectorAll("img, svg, i, span, a, button")].find((item) => visible(item) && /whatsapp/i.test(textOf(item)));
+    let row = node;
+    for (let i = 0; i < 8 && row?.parentElement; i += 1) {
+      const icons = [...row.querySelectorAll("img, svg, a, button")].filter(visible);
+      const hasWa = !!(wa && row.contains(wa));
+      if (hasWa && icons.length >= 3) break;
+      row = row.parentElement;
+    }
+    const link = node.closest?.("a, button, [role='button']") || node;
+    const attrs = {};
+    const keep = new Set(["id", "class", "src", "alt", "role", "type", "href", "title", "aria-label"]);
+    for (const source of [node, link !== node ? link : null]) {
+      if (!source?.attributes) continue;
+      for (const attr of source.attributes) {
+        if (attrs[attr.name]) continue;
+        if (attr.name === "onclick" || attr.name.startsWith("data-") || keep.has(attr.name)) attrs[attr.name] = clip(attr.value, 300);
+      }
+    }
+    const href = link?.getAttribute?.("href") || node.getAttribute?.("href") || "";
+    const onclick = node.getAttribute?.("onclick") || link?.getAttribute?.("onclick") || "";
+    return {
+      tag: node.tagName || "",
+      href: clip(href, 500),
+      onclick: clip(onclick, 500),
+      attrs,
+      elementHtml: clip(node.outerHTML, 1500),
+      rowHtml: clip((row || node).outerHTML, 3500),
+    };
+  });
+}
+
+async function findOauthUrl(page) {
+  for (const frame of safeFrames(page)) {
+    const found = await frame.evaluate(() => {
+      const interesting = /cjdropshipping|oauth|authorize/i;
+      const asset = /\.(?:png|jpe?g|gif|svg|css|woff2?|js|map)(?:$|\?)/i;
+      const chunks = [];
+      for (const script of document.scripts) {
+        if (script.src) chunks.push(script.src);
+        if (script.textContent) chunks.push(script.textContent.slice(0, 100000));
+      }
+      for (const el of document.querySelectorAll("[onclick]")) chunks.push(el.getAttribute("onclick") || "");
+      if (document.documentElement) chunks.push(document.documentElement.innerHTML.slice(0, 200000));
+      const blob = chunks.join("\n");
+      const candidates = [];
+      const push = (value) => {
+        const raw = String(value || "").trim().replace(/[),.;]+$/, "");
+        if (!raw || !interesting.test(raw) || asset.test(raw) || /^(javascript|data):/i.test(raw)) return;
+        if (!/^https?:\/\//i.test(raw) && !raw.startsWith("/") && !raw.startsWith("./") && !raw.startsWith("../")) return;
+        if (!candidates.includes(raw)) candidates.push(raw);
+      };
+      for (const match of blob.matchAll(/https?:\/\/[^\s"'`<>\\)]+/gi)) push(match[0]);
+      for (const match of blob.matchAll(/['"`]([^'"`]{1,500})['"`]/g)) push(match[1]);
+      for (const match of blob.matchAll(/['"](https?:\/\/[^'"]+)['"]\s*\+\s*['"]([^'"]+)['"]/g)) push(match[1] + match[2]);
+      return candidates.find((item) => /cjdropshipping/i.test(item) && /oauth|authorize/i.test(item))
+        || candidates.find((item) => /cjdropshipping/i.test(item))
+        || candidates[0]
+        || null;
+    }).catch((err) => {
+      if (isContextDestroyed(err)) return null;
+      return null;
+    });
+    if (found) return found;
+  }
+  return null;
+}
+
+async function checkAgreement(page) {
+  const names = [];
+  for (const frame of safeFrames(page)) {
+    const found = await frame.evaluate(() => {
+      const re = /agree|terms|privacy|policy|user agreement|sözleş|gizlilik|onay|协议|隐私/i;
+      const shown = (el) => {
+        if (!el) return false;
+        const style = getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      const hits = [];
+      for (const box of document.querySelectorAll("input[type='checkbox'], [role='checkbox']")) {
+        let labelEl = box.labels && box.labels.length ? box.labels[0] : box.closest("label");
+        if (!labelEl && box.id) {
+          try { labelEl = document.querySelector(`label[for="${CSS.escape(box.id)}"]`); } catch { labelEl = null; }
+        }
+        if (!shown(box) && !shown(labelEl)) continue;
+        const blob = [box.getAttribute("name"), box.getAttribute("id"), box.getAttribute("aria-label"), box.getAttribute("class"), labelEl ? labelEl.innerText : ""].filter(Boolean).join(" ");
+        if (!re.test(blob)) continue;
+        const role = box.getAttribute("role");
+        const checked = role === "checkbox" ? box.getAttribute("aria-checked") === "true" : !!box.checked;
+        if (checked) continue;
+        box.click();
+        if (role !== "checkbox" && !box.checked) {
+          box.checked = true;
+          box.dispatchEvent(new Event("input", { bubbles: true }));
+          box.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        hits.push(String(labelEl?.innerText || box.getAttribute("name") || box.id || "checkbox").replace(/\s+/g, " ").trim().slice(0, 80));
+      }
+      return hits;
+    }).catch((err) => {
+      if (isContextDestroyed(err)) return [];
+      throw err;
+    });
+    names.push(...(found || []));
+  }
+  return names;
+}
+
+async function acquireCj(session) {
+  const page = session.page;
+  if (!pageOpen(page)) return null;
+  if (CJ_BUTTON_OVERRIDE) {
+    return page.locator(CJ_BUTTON_OVERRIDE).first().elementHandle({ timeout: 3000 }).catch(() => null);
+  }
+  return findCj(page);
+}
+
+async function rememberCj(session, el) {
+  const markup = await readCjMarkup(el).catch(() => null);
+  const oauth = await findOauthUrl(session.page).catch(() => null);
+  session.cjDiag = { ...(markup || {}), oauth: oauth || "" };
+  log({
+    level: "info",
+    step: STEPS.cjButton.id,
+    stepNo: STEPS.cjButton.n,
+    stepName: STEPS.cjButton.name,
+    event: "markup",
+    email: session.email,
+    sessionId: session.id,
+    url: currentUrl(session.page),
+    message: `CJ öğesi ${session.cjDiag.tag || "?"} href=${session.cjDiag.href || "(yok)"}`,
+    detail: formatCjDiag(session.cjDiag),
+  });
+}
+
+async function parentControl(el) {
+  const parent = await el.evaluateHandle((node) => {
+    const own = node.closest?.("a, button, [role='button']");
+    const start = own && own !== node ? own : node.parentElement;
+    const host = start?.closest?.("a, button, [role='button']") || null;
+    return host && host !== node ? host : null;
+  });
+  const parentEl = parent.asElement();
+  if (!parentEl) await parent.dispose().catch(() => {});
+  return parentEl;
+}
+
+async function strategyApplies(session, name) {
+  if (name === "href" || name === "oauth") {
+    const raw = name === "href" ? session.cjDiag?.href : session.cjDiag?.oauth;
+    return !!usableHref(raw, currentUrl(session.page) || "");
+  }
+  if (name !== "üst") return true;
+  const el = await acquireCj(session);
+  if (!el) return false;
+  try {
+    const parentEl = await parentControl(el);
+    const ok = !!parentEl;
+    if (parentEl) await parentEl.dispose().catch(() => {});
+    return ok;
+  } finally {
+    await el.dispose().catch(() => {});
+  }
+}
+
+async function performStrategy(session, name) {
+  if (name === "href" || name === "oauth") {
+    const raw = name === "href" ? session.cjDiag?.href : session.cjDiag?.oauth;
+    const url = usableHref(raw, currentUrl(session.page) || session.page.url());
+    if (!url) return "skip";
+    await session.page.goto(url, { waitUntil: "domcontentloaded", timeout: cjStrategyWait() });
+    return "run";
+  }
+  const el = await acquireCj(session);
+  if (!el) throw new Error("CJ öğesi yeniden bulunamadı");
+  try {
+    if (name === "tık") {
+      await el.click({ timeout: 5000, noWaitAfter: true });
+      return "run";
+    }
+    if (name === "js") {
+      await el.evaluate((node) => node.click());
+      return "run";
+    }
+    const parentEl = await parentControl(el);
+    if (!parentEl) return "skip";
+    try {
+      await parentEl.evaluate((node) => node.click());
+    } finally {
+      await parentEl.dispose().catch(() => {});
+    }
+    return "run";
+  } finally {
+    await el.dispose().catch(() => {});
+  }
+}
+
+function logCjStrategy(session, message) {
+  log({
+    level: "info",
+    step: STEPS.popup.id,
+    stepNo: STEPS.popup.n,
+    stepName: STEPS.popup.name,
+    event: "strategy",
+    email: session.email,
+    sessionId: session.id,
+    url: currentUrl(session.page),
+    message,
+  });
+}
+
+async function runCjStrategies(session, watch) {
+  const waitMs = cjStrategyWait();
+  const tried = [];
+  let target = null;
+  let winner = "";
+  for (const name of ["tık", "üst", "js", "href", "oauth"]) {
+    if (target) break;
+    const applies = await strategyApplies(session, name).catch(() => false);
+    if (!applies) {
+      tried.push(`${name}:atlandı`);
+      logCjStrategy(session, `CJ denemesi atlandı: ${name}`);
+      continue;
+    }
+    logCjStrategy(session, `CJ denemesi: ${name}`);
+    const pending = watch.poll(waitMs);
+    let failure = null;
+    const acted = performStrategy(session, name).catch((err) => {
+      failure = err;
+    });
+    const found = await pending;
+    await acted;
+    tried.push(name);
+    if (failure && !isContextDestroyed(failure) && session.clickTrace && session.clickTrace.length < 12) {
+      session.clickTrace.push(redact(`strateji ${name}: ${failure.message || failure}`, 180));
+    }
+    if (found) {
+      target = found;
+      winner = name;
+    }
+  }
+  if (session.cjDiag) session.cjDiag.strategies = tried.join(",");
+  else session.cjDiag = { strategies: tried.join(",") };
+  return { target, winner, tried };
 }
 
 async function loginRoots(session) {
@@ -906,7 +1261,6 @@ async function loginRoots(session) {
   };
   if (session.loginFrame) roots.push(session.loginFrame);
   if (session.cjKind === "popup") pushPage(session.popup || session.active);
-  else if (session.cjKind === "frame") pushPage(session.page);
   else pushPage(session.active || session.page);
   return roots;
 }
@@ -1004,7 +1358,9 @@ async function runStep(ctx, step, fn) {
     const shots = await collectPageShots(ctx).catch(() => []);
     const screenshot = shots.find((shot) => shot.image)?.image || null;
     const kind = blockerKindOf(step, err);
-    const detailText = [publicDetail(err), surfaces].filter(Boolean).join(" | ");
+    const diagText = formatCjDiag(ctx.cjDiag);
+    const trace = Array.isArray(ctx.clickTrace) ? ctx.clickTrace.join(" | ") : "";
+    const detailText = [publicDetail(err), surfaces, diagText, trace].filter(Boolean).join(" | ");
     log({
       level: "error",
       step: step.id,
@@ -1124,54 +1480,73 @@ async function drive(session) {
 const STEP_FNS = {
   async cjButton(session) {
     const page = session.page;
+    let el = null;
     if (CJ_BUTTON_OVERRIDE) {
       const btn = page.locator(CJ_BUTTON_OVERRIDE).first();
       try {
         await btn.waitFor({ state: "visible", timeout: TIMEOUTS.cjButton });
+        el = await btn.elementHandle();
       } catch (err) {
         if (isTimeout(err) || isMissing(err)) err.code = "missing-button";
         throw err;
       }
-      session.cjClick = () => btn.click({ timeout: TIMEOUTS.cjButton, noWaitAfter: true });
-      return;
-    }
-    const deadline = Date.now() + TIMEOUTS.cjButton;
-    let el = null;
-    while (Date.now() < deadline) {
-      el = await findCj(page);
-      if (el) break;
-      await delay(200);
-    }
-    if (!el) throw Object.assign(new Error("missing-button"), { code: "missing-button" });
-    const position = await positionAgainstWhatsapp(el).catch(() => ({ ok: true, reason: "whatsapp-yok" }));
-    if (position && position.ok === false) {
-      await el.dispose().catch(() => {});
-      throw Object.assign(new Error("not-left"), { code: "not-left", position: `ikon x=${position.left}, WhatsApp x=${position.wa}` });
-    }
-    session.cjClick = async () => {
-      try {
-        await el.click({ timeout: TIMEOUTS.cjButton, noWaitAfter: true });
-      } finally {
-        await el.dispose().catch(() => {});
+    } else {
+      const deadline = Date.now() + TIMEOUTS.cjButton;
+      while (Date.now() < deadline) {
+        el = await findCj(page);
+        if (el) break;
+        await delay(200);
       }
-    };
+      if (!el) throw Object.assign(new Error("missing-button"), { code: "missing-button" });
+      const position = await positionAgainstWhatsapp(el).catch(() => ({ ok: true, reason: "whatsapp-yok" }));
+      if (position && position.ok === false) {
+        await el.dispose().catch(() => {});
+        throw Object.assign(new Error("not-left"), { code: "not-left", position: `ikon x=${position.left}, WhatsApp x=${position.wa}` });
+      }
+    }
+    try {
+      await rememberCj(session, el);
+    } finally {
+      await el.dispose().catch(() => {});
+    }
   },
   async popup(session) {
-    const timeout = Math.max(TIMEOUTS.popup, TIMEOUTS.navigation);
-    const watch = startCjWatch(session, timeout);
-    let target = null;
-    const clickTask = Promise.resolve().then(() => session.cjClick?.()).catch((err) => {
-      if (isContextDestroyed(err)) return null;
-      throw err;
-    });
+    const stopTrace = attachClickTrace(session);
+    const watch = armSurfaceWatch(session);
+    let opened = null;
     try {
-      [target] = await Promise.all([watch, clickTask]);
-    } catch (err) {
-      target = await Promise.race([watch, delay(1500).then(() => null)]);
-      if (!target) throw err;
+      const agreed = await checkAgreement(session.page).catch((err) => {
+        if (isContextDestroyed(err)) return [];
+        if (session.clickTrace && session.clickTrace.length < 12) session.clickTrace.push(redact(`sozlesme: ${err.message || err}`, 180));
+        return [];
+      });
+      if (agreed.length) {
+        session.cjDiag = { ...(session.cjDiag || {}), agreement: agreed };
+        log({
+          level: "info",
+          step: STEPS.popup.id,
+          stepNo: STEPS.popup.n,
+          stepName: STEPS.popup.name,
+          event: "agreement",
+          email: session.email,
+          sessionId: session.id,
+          url: currentUrl(session.page),
+          message: `Sözleşme kutusu işaretlendi: ${agreed.join(", ")}`,
+        });
+      }
+      opened = await runCjStrategies(session, watch);
+    } finally {
+      watch.stop();
+      stopTrace();
     }
+    const target = opened?.target;
     if (!target) {
-      throw Object.assign(new Error("no-redirect"), { code: "no-redirect", surfaces: await describeSurfaces(session) });
+      throw Object.assign(new Error("no-redirect"), {
+        code: "no-redirect",
+        surfaces: await describeSurfaces(session),
+        diag: session.cjDiag,
+        trace: (session.clickTrace || []).join(" | "),
+      });
     }
     session.cjKind = target.kind;
     if (target.kind === "popup") {
@@ -1187,6 +1562,7 @@ const STEP_FNS = {
       session.active = target.page;
       await target.page.waitForLoadState("domcontentloaded", { timeout: TIMEOUTS.navigation }).catch(() => {});
     }
+    const how = opened.winner ? ` (${opened.winner})` : "";
     log({
       level: "info",
       step: STEPS.popup.id,
@@ -1196,7 +1572,7 @@ const STEP_FNS = {
       email: session.email,
       sessionId: session.id,
       url: target.kind === "frame" ? target.frame.url() : currentUrl(target.page),
-      message: target.kind === "popup" ? "CJ penceresi açıldı" : target.kind === "frame" ? "CJ çerçevesi bulundu" : "CJ sayfasına geçildi",
+      message: target.kind === "popup" ? `CJ penceresi açıldı${how}` : target.kind === "frame" ? `CJ çerçevesi bulundu${how}` : `CJ sayfasına geçildi${how}`,
     });
   },
   async email(session) {
@@ -1458,13 +1834,13 @@ function failureBody(err, session) {
     return {
       ok: false,
       status: "error",
-      error: redact(err.message, 1500),
+      error: redact(err.message, 9000),
       step: err.stepId,
       url: safeUrl,
       screenshot: screenshots[0]?.image || shot,
       screenshots,
       blocker: err.blocker ?? null,
-      detail: err.detail ? redact(err.detail, 1500) : null,
+      detail: err.detail ? redact(err.detail, 9000) : null,
     };
   }
   const step = session?.currentStep;
@@ -1495,10 +1871,10 @@ async function withSessionSecrets(session, code, fn) {
   }
 }
 
-const configured = ["QK_LOGIN_URL", "SEL_LOGIN_URL", "SEL_CJ_BUTTON", "SEL_CJ_EMAIL", "SEL_CJ_PASSWORD", "SEL_CJ_SUBMIT", "SEL_CJ_AUTHORIZE", "SEL_SUCCESS", "SEL_ERROR_TEXT", "SEL_CAPTCHA", "SEL_CAPTCHA_INPUT", "SEL_CAPTCHA_SUBMIT", "SEL_CAPTCHA_IMAGE", "BROWSER_LOCALE", "BROWSER_TZ", "BROWSER_UA", "PROXY_URL", "TIMEOUT_OPEN_LOGIN", "TIMEOUT_CAPTCHA", "TIMEOUT_CJ_BUTTON", "TIMEOUT_POPUP", "TIMEOUT_NAVIGATION", "TIMEOUT_EMAIL", "TIMEOUT_PASSWORD", "TIMEOUT_SUBMIT", "TIMEOUT_AUTHORIZE", "TIMEOUT_SUCCESS", "SESSION_TTL_MS"]
+const configured = ["QK_LOGIN_URL", "SEL_LOGIN_URL", "SEL_CJ_BUTTON", "SEL_CJ_EMAIL", "SEL_CJ_PASSWORD", "SEL_CJ_SUBMIT", "SEL_CJ_AUTHORIZE", "SEL_SUCCESS", "SEL_ERROR_TEXT", "SEL_CAPTCHA", "SEL_CAPTCHA_INPUT", "SEL_CAPTCHA_SUBMIT", "SEL_CAPTCHA_IMAGE", "BROWSER_LOCALE", "BROWSER_TZ", "BROWSER_UA", "PROXY_URL", "TIMEOUT_OPEN_LOGIN", "TIMEOUT_CAPTCHA", "TIMEOUT_CJ_BUTTON", "TIMEOUT_CJ_CLICK", "TIMEOUT_POPUP", "TIMEOUT_NAVIGATION", "TIMEOUT_EMAIL", "TIMEOUT_PASSWORD", "TIMEOUT_SUBMIT", "TIMEOUT_AUTHORIZE", "TIMEOUT_SUCCESS", "SESSION_TTL_MS"]
   .filter((name) => typeof process.env[name] === "string" && process.env[name].trim() !== "");
 log({ level: "info", step: "config", event: "env", message: configured.length ? `Ayarlı ortam değişkenleri: ${configured.join(", ")}` : "Seçici ve zaman aşımı varsayılanları kullanılıyor" });
-log({ level: "info", step: "config", event: "timeouts", message: `Zaman aşımları ms: açık=${TIMEOUTS.openLogin}, captcha=${TIMEOUTS.captcha}, cj=${TIMEOUTS.cjButton}, proxy=${PROXY_URL ? "var" : "yok"}` });
+log({ level: "info", step: "config", event: "timeouts", message: `Zaman aşımları ms: açık=${TIMEOUTS.openLogin}, captcha=${TIMEOUTS.captcha}, cj=${TIMEOUTS.cjButton}, cjTik=${envMs("TIMEOUT_CJ_CLICK", 20000)}, proxy=${PROXY_URL ? "var" : "yok"}` });
 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
