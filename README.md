@@ -5,11 +5,9 @@ Müşterinin CJ Dropshipping hesabı açıldıktan sonra, operatör bu uygulaman
 ## Render'a kurulum
 1. Render → **New → Blueprint** → bu repoyu seç (`render.yaml` otomatik okunur). Ya da **New → Web Service → Docker** seç.
 2. Plan: en az **Starter** (Chromium için ücretsiz plan belleği yetmeyebilir).
-3. Ortam değişkenleri:
-   - `APP_PASSWORD` (zorunlu): arayüz ve API şifresi. Tarayıcı kullanıcı adı sorar (herhangi bir şey yazın), şifre olarak bunu girin.
-   - Seçiciler ve adım zaman aşımları aşağıda. Canlı sitede buton veya alan farklıysa kod değiştirmeden Render env ile düzeltin.
+3. Seçiciler ve adım zaman aşımları aşağıda. Canlı sitede buton veya alan farklıysa kod değiştirmeden Render env ile düzeltin. Arayüz ve API şifre istemez.
 4. Deploy sonrası servis URL'ini açın, formu doldurup **Başlat**'a basın.
-5. Sağlık kontrolü `GET /healthz` (kimlik doğrulamasız, gövde `ok`). `render.yaml` bunu kullanır.
+5. Sağlık kontrolü `GET /healthz` (gövde `ok`). `render.yaml` bunu kullanır.
 
 ## Adımlar
 Hata olursa yanıt ve arayüz, başarısız adımı Türkçe söyler. Zaman aşımında mesajın sonuna `(zaman aşımı)` eklenir. Yanıtta `url` (o anki sayfa) ve `screenshot` (base64 PNG) da vardır.
@@ -36,7 +34,7 @@ Ayrıca şu engeller açıkça yazılır:
 Login sayfasını açma (adım 2) ve CJ sayfasının yüklenmesi (adım 4) geçici bir gezinme hatasına düşerse (bağlantı koptu, `net::ERR_*`, zaman aşımı) **bir kez** yeniden dener. İkinci deneme de düşerse o adımın hatası döner.
 
 ## API
-`POST /onboard` (Basic auth, şifre = `APP_PASSWORD`), gövde: `{"cjEmail":"...","cjPassword":"..."}`
+`POST /onboard`, gövde: `{"cjEmail":"...","cjPassword":"..."}`
 
 Başarı: `{"ok":true,"url":"..."}`
 
@@ -48,7 +46,7 @@ Hata:
 
 `blocker` şunlardan biri olabilir: `captcha`, `credentials`, `timeout`, `browser`, `selector`, ya da `null`.
 
-`GET /healthz` → `200` ve `ok`. Şifre istemez.
+`GET /healthz` → `200` ve `ok`.
 
 ## Seçiciler
 Hepsi Playwright seçicisidir. Boş bırakılırsa varsayılan kullanılır. `QK_LOGIN_URL` tanımlıysa `SEL_LOGIN_URL` yok sayılır.

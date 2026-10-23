@@ -1,5 +1,4 @@
 import express from "express";
-import crypto from "node:crypto";
 import { chromium } from "playwright";
 
 // CJ şifresi yalnızca istek süresince burada durur; log ve yanıtlardan silinir.
@@ -654,16 +653,6 @@ async function onboard({ cjEmail, cjPassword }) {
   }
 }
 
-const APP_PASSWORD = process.env.APP_PASSWORD;
-if (!APP_PASSWORD) {
-  log({
-    level: "warn",
-    step: "config",
-    event: "missing-password",
-    message: "APP_PASSWORD tanımlı değil, /healthz dışındaki istekler reddedilecek",
-  });
-}
-
 const configured = ["QK_LOGIN_URL", "SEL_LOGIN_URL", "SEL_CJ_BUTTON", "SEL_CJ_EMAIL", "SEL_CJ_PASSWORD", "SEL_CJ_SUBMIT", "SEL_CJ_AUTHORIZE", "SEL_SUCCESS", "SEL_ERROR_TEXT", "SEL_CAPTCHA", "TIMEOUT_OPEN_LOGIN", "TIMEOUT_CJ_BUTTON", "TIMEOUT_POPUP", "TIMEOUT_NAVIGATION", "TIMEOUT_EMAIL", "TIMEOUT_PASSWORD", "TIMEOUT_SUBMIT", "TIMEOUT_AUTHORIZE", "TIMEOUT_SUCCESS"]
   .filter((name) => typeof process.env[name] === "string" && process.env[name].trim() !== "");
 log({ level: "info", step: "config", event: "env", message: configured.length ? `Ayarlı ortam değişkenleri: ${configured.join(", ")}` : "Seçici ve zaman aşımı varsayılanları kullanılıyor" });
@@ -671,22 +660,8 @@ log({ level: "info", step: "config", event: "env", message: configured.length ? 
 const app = express();
 app.use(express.json({ limit: "100kb" }));
 
-// Render sağlık kontrolü kimlik doğrulamasız olmalı. Bu rota auth'tan önce kayıtlı.
 app.get("/healthz", (_req, res) => {
   res.status(200).type("text/plain; charset=utf-8").send("ok");
-});
-
-const safeEq = (a = "", b = "") => {
-  const x = Buffer.from(String(a));
-  const y = Buffer.from(String(b));
-  return x.length === y.length && crypto.timingSafeEqual(x, y);
-};
-
-app.use((req, res, next) => {
-  const [type, val] = (req.get("authorization") || "").split(" ");
-  const pass = type === "Basic" && val ? Buffer.from(val, "base64").toString().split(":").slice(1).join(":") : "";
-  if (APP_PASSWORD && safeEq(pass, APP_PASSWORD)) return next();
-  res.set("WWW-Authenticate", 'Basic realm="qksource-onboard"').status(401).send("Yetkisiz");
 });
 
 let busy = false;
